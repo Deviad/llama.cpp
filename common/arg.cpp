@@ -10,6 +10,12 @@
 #include "speculative.h"
 #include "preset.h"
 
+// Story S1 (LLAMACPP_GLM52_ENHANCEMENT_PLAN.md): forward declaration of the
+// slab byte-size parser, defined in src/llama-expert-slab.cpp (linked via the
+// llama target). Keep src/ private; only expose the one free function the CLI
+// flag parser needs.
+size_t llama_expert_slab_parse_bytes(const std::string & s, std::string & err);
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -2267,6 +2273,47 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.use_mmap = value;
         }
     ).set_env("LLAMA_ARG_MMAP"));
+    // --- SSD streaming of routed experts (Story S1, LLAMACPP_GLM52_ENHANCEMENT_PLAN.md) ---
+    add_opt(common_arg(
+        {"--streaming-cache-experts"}, "N",
+        "number of routed-expert slots in the SSD streaming slab cache (default: 0 = disabled). "
+        "When >0, a resident slab of N experts is constructed and (in later stories) pre-warmed "
+        "from --hotlist and intercepts MoE dispatch. Default-off: inference is byte-identical when 0.",
+        [](common_params & params, const std::string & value) {
+            params.streaming_cache_experts = std::stoull(value);
+        }
+    ).set_env("LLAMA_ARG_STREAMING_CACHE_EXPERTS"));
+    add_opt(common_arg(
+        {"--streaming-cache-bytes"}, "BYTES",
+        "explicit byte budget for the SSD streaming slab cache (e.g. 16gib, 8192m, 4gb). "
+        "Overrides the auto cache-plan sizing (recommended*4/5 - non_routed). "
+        "Ignored when --streaming-cache-experts is 0.",
+        [](common_params & params, const std::string & value) {
+            std::string err;
+            size_t b = llama_expert_slab_parse_bytes(value, err);
+            if (!err.empty()) {
+                throw std::invalid_argument("--streaming-cache-bytes: " + err);
+            }
+            params.streaming_cache_bytes = b;
+        }
+    ).set_env("LLAMA_ARG_STREAMING_CACHE_BYTES"));
+    add_opt(common_arg(
+        {"--hotlist"}, "FILE",
+        "path to a '# ds4 expert hotlist v1' file for slab pre-warm (Story S4). "
+        "Lines: '<layer> <expert> <hits> <weight>' sorted by descending weight. "
+        "Top min(N_hot, cache_experts) entries are pre-loaded before the first token.",
+        [](common_params & params, const std::string & value) {
+            params.streaming_hotlist = value;
+        }
+    ).set_env("LLAMA_ARG_STREAMING_HOTLIST"));
+    add_opt(common_arg(
+        {"--hotlist-out"}, "FILE",
+        "path to write a measured '# ds4 expert hotlist v1' file at exit (Story S5). "
+        "Records per-(layer, expert) selection counts observed during inference.",
+        [](common_params & params, const std::string & value) {
+            params.streaming_hotlist_out = value;
+        }
+    ).set_env("LLAMA_ARG_STREAMING_HOTLIST_OUT"));
     add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},

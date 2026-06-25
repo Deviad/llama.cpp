@@ -468,6 +468,16 @@ struct common_params {
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
 
+    // --- SSD streaming of routed experts (Story S1, LLAMACPP_GLM52_ENHANCEMENT_PLAN.md) ---
+    // Default-off: when streaming_cache_experts == 0, inference is byte-identical
+    // to today. When >0, a routed-expert slab cache is constructed (S1) and, in
+    // later stories, pre-warmed from a hotlist (S4) and intercepts the MoE
+    // dispatch (S7). S1 only constructs the slab + reports the plan.
+    size_t streaming_cache_experts = 0; // 0 = disabled; else slot count
+    size_t streaming_cache_bytes   = 0; // 0 = size from plan_cache; else explicit budget
+    std::string streaming_hotlist;      // path to '# ds4 expert hotlist v1' file (Story S4)
+    std::string streaming_hotlist_out;  // path to write measured hotlist at exit (Story S5)
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

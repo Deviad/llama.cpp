@@ -119,6 +119,9 @@ endfunction()
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
+# Story S1 (LLAMACPP_GLM52_ENHANCEMENT_PLAN.md): routed-expert slab cache.
+llama_build(test-expert-slab.cpp)
+
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-command-r         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-command-r.gguf)
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-deepseek-coder    ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-deepseek-coder.gguf)
