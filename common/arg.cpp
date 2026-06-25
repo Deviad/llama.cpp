@@ -2323,6 +2323,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TRACE_PREFETCH"));
     add_opt(common_arg(
+        {"--streaming-report"},
+        "print a per-layer routed-expert report at shutdown: for each layer, list "
+        "uniform/boosted (does the layer's qtype match the slab class?), the gate/up/down "
+        "qtypes + per-expert byte stride, and whether the slab or mmap path served it. "
+        "Story S7: confirms spliced boosted layers (Story S8) coexist with the slab "
+        "without correctness bugs.",
+        [](common_params & params) {
+            params.streaming_report = true;
+        }
+    ).set_env("LLAMA_ARG_STREAMING_REPORT"));
+    add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},
         string_format("use DirectIO if available. (default: %s)", params.use_direct_io ? "enabled" : "disabled"),

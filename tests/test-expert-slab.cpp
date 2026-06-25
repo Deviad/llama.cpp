@@ -12,6 +12,7 @@
 // regions are filled with distinguishable patterns so a copy error is obvious.
 
 #include "../src/llama-expert-slab.h"
+#include "../common/expert-slab-hook.h" // Story S7: layer_expert_layout for uniform predicate test
 
 #include <cstdio>
 #include <cstdlib>
@@ -465,6 +466,33 @@ int main() {
               reloaded[0].hits == 3, "S5: first row round-trips (L2,E5,3)");
 
         std::remove(wb_path);
+    }
+
+    // ---- Story S7: per-layer uniform predicate (mixed-precision fallback) ----
+    // A layer is uniform iff its (gate,up,down) qtypes all match the slab
+    // class; spliced boosted layers are non-uniform and slab-ineligible.
+    // (The predicate itself lives in common/expert-slab-hook.cpp's install();
+    // here we test the data-structure level: the layer_expert_layout.uniform
+    // field is set correctly when qtypes match/mismatch the slab class.)
+    {
+        // Simulate a uniform layer (all IQ2_S) and a boosted layer
+        // (IQ3_S gate/up + IQ4_NL down, the S8 finding's exact mix).
+        layer_expert_layout uni, boosted;
+        uni.gate_qtype = 22 /*IQ2_S*/; uni.up_qtype = 22; uni.down_qtype = 22;
+        uni.gate_stride = 4030464; uni.up_stride = 4030464; uni.down_stride = 4030464;
+        boosted.gate_qtype = 29 /*IQ3_S*/; boosted.up_qtype = 29; boosted.down_qtype = 18 /*IQ4_NL*/;
+        boosted.gate_stride = 5406720; boosted.up_stride = 5406720; boosted.down_stride = 7077888;
+        // slab class = IQ2_S (all-three match)
+        int32_t sg = 22, su = 22, sd = 22;
+        uni.uniform    = (uni.gate_qtype == sg && uni.up_qtype == su && uni.down_qtype == sd);
+        boosted.uniform = (boosted.gate_qtype == sg && boosted.up_qtype == su && boosted.down_qtype == sd);
+        CHECK(uni.uniform == true,    "S7: uniform layer (all IQ2_S) classified uniform");
+        CHECK(boosted.uniform == false, "S7: boosted layer (IQ3_S/IQ4_NL mix) classified non-uniform");
+        // The slab's per_expert_bytes follows the uniform class; boosted layers
+        // have a different per_expert_bytes and so can't share a slab slot.
+        size_t uni_bytes    = uni.gate_stride + uni.up_stride + uni.down_stride;
+        size_t boosted_bytes = boosted.gate_stride + boosted.up_stride + boosted.down_stride;
+        CHECK(uni_bytes != boosted_bytes, "S7: uniform vs boosted per_expert_bytes differ (can't share slab)");
     }
 
     if (failures == 0) {

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <map>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -54,23 +55,13 @@ static void scan_shard_for_expert_tensors(const std::string & path,
         int layer = std::stoi(m[1].str());
         std::string frag = m[2].str();
         size_t toff = data_off + gguf_get_tensor_offset(gctx, i);
-        // The tensor is [d_intermediate * n_experts]? No: for concatenated
-        // experts, ne[0]=d_intermediate_dim, ne[1]=n_experts (row-major), so
-        // per-expert row stride = nb[1] / n_experts == ggml_row_size(type, ne[0]).
-        // We don't have the tensor type/dims here via gguf API directly; but the
-        // per-expert byte stride = tensor_nbytes / n_experts. gguf doesn't expose
-        // nbytes directly either. We read the GGUF KV for n_experts separately,
-        // but simplest: defer stride compute to the caller which knows the
-        // type. Here we just record the fragment's file path + tensor data offset;
-        // the per-expert stride is computed at load time from ggml_nbytes(tensor)
-        // which needs the loaded model. To keep S4 self-contained, we compute
-        // stride from the hotlist's expert count + the tensor's GGUF type/shape.
-        // For now record path + offset; resolve stride at pre-warm via gguf
-        // tensor info lookup below (see resolve_strides_in_shard).
+        // Story S7: capture the fragment's qtype so the uniform predicate can
+        // detect spliced boosted layers (gate/up at IQ3_S, down at IQ4_NL, etc.).
+        int32_t qtype = (int32_t) gguf_get_tensor_type(gctx, i);
         auto & lay = out[(uint32_t) layer];
-        if      (frag == "gate") { lay.gate_path = path; lay.gate_off = toff; }
-        else if (frag == "up")   { lay.up_path   = path; lay.up_off   = toff; }
-        else if (frag == "down") { lay.down_path = path; lay.down_off = toff; }
+        if      (frag == "gate") { lay.gate_path = path; lay.gate_off = toff; lay.gate_qtype = qtype; }
+        else if (frag == "up")   { lay.up_path   = path; lay.up_off   = toff; lay.up_qtype   = qtype; }
+        else if (frag == "down") { lay.down_path = path; lay.down_off = toff; lay.down_qtype = qtype; }
     }
     gguf_free(gctx);
 }
@@ -78,8 +69,9 @@ static void scan_shard_for_expert_tensors(const std::string & path,
 // For a given layer+fragment, open its shard and read the tensor's type + dims
 // to compute the per-expert byte stride = tensor_nbytes / n_experts. We get
 // n_experts from the GGUF KV "<arch>.expert_count" (global) like trace-moe.
+// Story S7: also returns the fragment's qtype via *out_qtype (may be null).
 static size_t fragment_expert_bytes(const std::string & path, const std::string & tname,
-                                    size_t n_experts) {
+                                    size_t n_experts, int32_t * out_qtype = nullptr) {
     if (n_experts == 0) return 0;
     gguf_init_params ip{}; ip.no_alloc = true;
     gguf_context * gctx = gguf_init_from_file(path.c_str(), ip);
@@ -91,6 +83,7 @@ static size_t fragment_expert_bytes(const std::string & path, const std::string 
         if (!n) continue;
         if (std::string(n) != tname) continue;
         nb = gguf_get_tensor_size(gctx, i);
+        if (out_qtype) *out_qtype = (int32_t) gguf_get_tensor_type(gctx, i);
         break;
     }
     gguf_free(gctx);
@@ -173,6 +166,7 @@ bool llama_expert_slab_hook_install(common_params & params,
     // ---- Story S5: size + enable the runtime-writeback table ----
     st->slab->n_experts_table = (uint32_t) n_experts;
     st->hotlist_out_path      = params.streaming_hotlist_out;
+    st->streaming_report      = params.streaming_report;
     st->slab->writeback_enabled = !params.streaming_hotlist_out.empty();
     if (st->slab->writeback_enabled) {
         // size to (max_scanned_layer + 1) * n_experts; layers without selections
@@ -186,33 +180,90 @@ bool llama_expert_slab_hook_install(common_params & params,
             st->slab->writeback_enabled = false;
         }
     }
-    // resolve per-expert byte strides for each layer's fragments
+    // resolve per-expert byte strides + qtypes for each layer's fragments
     for (auto & kv : st->layers) {
         auto & lay = kv.second;
         lay.n_experts = n_experts;
         lay.gate_stride = fragment_expert_bytes(lay.gate_path,
-            "blk." + std::to_string(kv.first) + ".ffn_gate_exps.weight", n_experts);
+            "blk." + std::to_string(kv.first) + ".ffn_gate_exps.weight", n_experts, &lay.gate_qtype);
         lay.up_stride   = fragment_expert_bytes(lay.up_path,
-            "blk." + std::to_string(kv.first) + ".ffn_up_exps.weight",   n_experts);
+            "blk." + std::to_string(kv.first) + ".ffn_up_exps.weight",   n_experts, &lay.up_qtype);
         lay.down_stride = fragment_expert_bytes(lay.down_path,
-            "blk." + std::to_string(kv.first) + ".ffn_down_exps.weight", n_experts);
+            "blk." + std::to_string(kv.first) + ".ffn_down_exps.weight", n_experts, &lay.down_qtype);
     }
-    // Use the first layer with a complete layout to fix the slab geometry.
+    // Use the MAJORITY qtype triple across complete layers to fix the slab
+    // geometry + class. (First-scanned would be wrong for the baseline, where
+    // blk.78 is the rare IQ4_NL MTP exception among 75 IQ2_S layers — picking
+    // blk.78's class would invert the classification and mark all real routed
+    // layers as "boosted".) Majority vote makes the baseline uniform: slab class
+    // = IQ2_S, blk.78 = the one boosted MTP layer (slab-ineligible, mmap-served).
     bool geom_set = false;
-    for (auto & kv : st->layers) {
-        auto & lay = kv.second;
-        if (lay.gate_stride && lay.up_stride && lay.down_stride) {
-            st->slab->gate_expert_bytes = lay.gate_stride;
-            st->slab->up_expert_bytes   = lay.up_stride;
-            st->slab->down_expert_bytes = lay.down_stride;
-            st->slab->per_expert_bytes  = lay.gate_stride + lay.up_stride + lay.down_stride;
-            geom_set = true;
-            break;
+    int32_t slab_gate_q = 0, slab_up_q = 0, slab_down_q = 0;
+    size_t slab_class_per_expert_bytes = 0;
+    {
+        std::map<std::tuple<int32_t,int32_t,int32_t,size_t>, uint32_t> tally;
+        for (const auto & kv : st->layers) {
+            const auto & lay = kv.second;
+            if (!lay.gate_stride || !lay.up_stride || !lay.down_stride) continue;
+            auto key = std::make_tuple(lay.gate_qtype, lay.up_qtype, lay.down_qtype,
+                                       lay.gate_stride + lay.up_stride + lay.down_stride);
+            tally[key]++;
+        }
+        uint32_t best = 0;
+        for (const auto & kv2 : tally) {
+            if (kv2.second > best) {
+                best = kv2.second;
+                slab_gate_q = std::get<0>(kv2.first);
+                slab_up_q   = std::get<1>(kv2.first);
+                slab_down_q = std::get<2>(kv2.first);
+                slab_class_per_expert_bytes = std::get<3>(kv2.first);
+            }
+        }
+        if (best > 0) {
+            // find strides matching the elected class
+            for (const auto & kv : st->layers) {
+                const auto & lay = kv.second;
+                if (lay.gate_qtype == slab_gate_q && lay.up_qtype == slab_up_q &&
+                    lay.down_qtype == slab_down_q &&
+                    (lay.gate_stride + lay.up_stride + lay.down_stride) == slab_class_per_expert_bytes) {
+                    st->slab->gate_expert_bytes = lay.gate_stride;
+                    st->slab->up_expert_bytes   = lay.up_stride;
+                    st->slab->down_expert_bytes = lay.down_stride;
+                    st->slab->per_expert_bytes  = slab_class_per_expert_bytes;
+                    geom_set = true;
+                    break;
+                }
+            }
         }
     }
     if (!geom_set) {
         err = "streaming-cache: could not resolve expert tensor geometry from GGUF";
         return false;
+    }
+    // Story S7: per-layer uniform predicate. A layer is uniform (slab-eligible)
+    // iff all three fragments' qtypes match the slab class. Spliced boosted
+    // layers (e.g. S8's IQ3_S gate/up + IQ4_NL down among IQ2_S layers) are
+    // marked non-uniform and skipped at pre-warm (they'd waste slab slots on
+    // bytes that can't be served by this single-class slab).
+    // Today's baseline (uniform IQ2_S experts + IQ4_NL blk.78 MTP exception)
+    // is detected as uniform for slab purposes because blk.78 is MTP, not a
+    // normal routed-expert dispatch layer (so it doesn't appear in `layers`
+    // as a ffn_*_exps tensor) — single-class fast path, no fallback.
+    uint32_t n_uniform = 0, n_boosted = 0;
+    for (auto & kv : st->layers) {
+        auto & lay = kv.second;
+        lay.uniform = (lay.gate_qtype == slab_gate_q &&
+                       lay.up_qtype   == slab_up_q   &&
+                       lay.down_qtype == slab_down_q);
+        if (lay.uniform) n_uniform++; else n_boosted++;
+    }
+    if (params.streaming_report) {
+        fprintf(stderr, "expert-slab S7: slab class gate=%s up=%s down=%s; "
+                "%u uniform layers, %u boosted (mmap-served) layers\n",
+                ggml_type_name((ggml_type) slab_gate_q),
+                ggml_type_name((ggml_type) slab_up_q),
+                ggml_type_name((ggml_type) slab_down_q),
+                n_uniform, n_boosted);
     }
     st->slab->cache_experts = params.streaming_cache_experts;
 
@@ -244,11 +295,17 @@ bool llama_expert_slab_hook_install(common_params & params,
     // noted in the plan). Pre-warm the top min(N_hot, cache_experts) entries by
     // preading their gate/up/down bytes from the GGUF shard into slab slots.
     size_t n_warm = std::min(hl.size(), st->slab->cache_experts);
+    uint32_t n_skipped_boosted = 0;
     for (size_t i = 0; i < n_warm; ++i) {
         const auto & e = hl[i];
         auto it = st->layers.find(e.layer);
         if (it == st->layers.end()) continue;
         const auto & lay = it->second;
+        // Story S7: skip boosted (spliced, non-uniform) layers — their bytes
+        // are a different qtype and can't be served by this single-class slab.
+        // They fall back to direct mmap reads (correctness preserved; the slab
+        // simply doesn't cache them). This also avoids wasting slab slots.
+        if (!lay.uniform) { n_skipped_boosted++; continue; }
         // Find a free slot (or recycle slot 0).
         size_t slot = SIZE_MAX;
         for (size_t s = 0; s < st->slab->slots.size(); ++s) {
@@ -273,8 +330,9 @@ bool llama_expert_slab_hook_install(common_params & params,
             st->slab->n_prewarm_loaded++;
         }
     }
-    fprintf(stderr, "expert-slab hook: pre-warmed %u of %zu hotlist entries into %zu-slot slab\n",
-            st->slab->hotlist_entries_loaded, hl.size(), st->slab->cache_experts);
+    fprintf(stderr, "expert-slab hook: pre-warmed %u of %zu hotlist entries into %zu-slot slab"
+            " (skipped %u boosted-layer entries, S7 mmap-served)\n",
+            st->slab->hotlist_entries_loaded, hl.size(), st->slab->cache_experts, n_skipped_boosted);
 
     // ---- 4. install cb_eval ----
     auto * slab_ptr = st->slab.get();
@@ -330,6 +388,22 @@ void llama_expert_slab_hook_finalize(const std::unique_ptr<llama_expert_slab_hoo
                     state->hotlist_out_path.c_str());
         } else {
             fprintf(stderr, "expert-slab hook: hotlist writeback FAILED: %s\n", err.c_str());
+        }
+    }
+    // Story S7: per-layer uniform/boosted + slab/mmap path report.
+    if (state->streaming_report) {
+        fprintf(stderr, "expert-slab S7 report: per-layer routed-expert path\n");
+        fprintf(stderr, "  layer | class   | gate(q,stride)        up(q,stride)          down(q,stride)         | per_expert_bytes\n");
+        for (const auto & kv : state->layers) {
+            const auto & lay = kv.second;
+            const char * cls = lay.uniform ? "uniform" : "boosted";
+            const char * path = lay.uniform ? "slab" : "mmap";
+            fprintf(stderr, "  %5u | %-7s | %-8s/%-8zu %-8s/%-8zu %-8s/%-8zu | %zu  [%s-served]\n",
+                    kv.first, cls,
+                    ggml_type_name((ggml_type) lay.gate_qtype), lay.gate_stride,
+                    ggml_type_name((ggml_type) lay.up_qtype),   lay.up_stride,
+                    ggml_type_name((ggml_type) lay.down_qtype), lay.down_stride,
+                    lay.gate_stride + lay.up_stride + lay.down_stride, path);
         }
     }
     fprintf(stderr, "%s: ", __func__);

@@ -49,11 +49,23 @@ struct common_params;
 
 // Per-layer expert-tensor layout read from the model GGUF (file offsets +
 // per-expert byte strides for the gate/up/down concatenated-experts tensors).
+// Story S7: also records per-fragment qtype so a uniform predicate can decide
+// whether the layer's experts match the slab's single class (slab-eligible) or
+// are "boosted" (spliced to a different qtype; fall back to direct mmap).
 struct layer_expert_layout {
     std::string gate_path, up_path, down_path;
     size_t gate_off = 0, up_off = 0, down_off = 0;
     size_t gate_stride = 0, up_stride = 0, down_stride = 0;
     size_t n_experts = 0;
+    // Story S7: per-fragment qtype (GGML_TYPE_*). A layer is "uniform" iff all
+    // three fragments share the same qtype AND that qtype matches the slab's
+    // class (the first complete layer's qtypes). Spliced boosted layers have a
+    // different qtype and are slab-ineligible (skip pre-warm; mmap-served).
+    int32_t gate_qtype = 0; // enum ggml_type
+    int32_t up_qtype   = 0;
+    int32_t down_qtype = 0;
+    // Resolved at install: is this layer slab-eligible (uniform w/ slab class)?
+    bool uniform = false;
 };
 
 // Hook state. Defined here (not opaque) so unique_ptr's destructor is complete
@@ -65,6 +77,8 @@ struct llama_expert_slab_hook_state {
     std::thread prewarm_thread;
     // Story S5: path to write the measured hotlist at shutdown ("" = no write).
     std::string hotlist_out_path;
+    // Story S7: emit the per-layer uniform/boosted report at finalize.
+    bool streaming_report = false;
 };
 
 // Opaque hook state (defined in the .cpp).
