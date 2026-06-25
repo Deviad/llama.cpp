@@ -95,6 +95,7 @@ bool llama_expert_slab_cache::alloc(std::string & err) {
     slab = static_cast<uint8_t *>(p);
     std::memset(slab, 0, slab_bytes);
     slots.assign(cache_experts, slot_state{});
+    slot_ready.assign(cache_experts, false); // pre-warm sets these true as loads complete
     map.clear();
     map.reserve(cache_experts * 2);
     n_hit = n_miss = n_prewarm_loaded = 0;
@@ -210,6 +211,14 @@ void llama_expert_slab_cache::print_summary(const char * label) const {
         (unsigned long long) n_prewarm_loaded,
         mlocked ? "yes" : "no", mlocked_bytes, budget_bytes,
         LLAMA_EXPERT_SLAB_MLOCK_CHUNK / (1024*1024));
+    fprintf(stderr,
+        "expert-slab: hotlist_entries_loaded=%u prewarm_hits=%llu prewarm_misses=%llu "
+        "first_token_hit_rate=%.1f%%\n",
+        hotlist_entries_loaded,
+        (unsigned long long) prewarm_hits,
+        (unsigned long long) prewarm_misses,
+        (prewarm_hits + prewarm_misses) == 0 ? 0.0 :
+            100.0 * (double) prewarm_hits / (double)(prewarm_hits + prewarm_misses));
 }
 
 bool llama_expert_slab_cache::alloc_locked(size_t budget_bytes_in, std::string & err) {
@@ -291,6 +300,55 @@ int llama_expert_slab_prefetch_willneed(const void * mmap_base, size_t offset,
     }
     return 0;
 #endif
+}
+
+
+// --- Story S4: hotlist parser + dispatch-hook counting ---
+
+std::vector<llama_expert_slab_hotlist_entry>
+llama_expert_slab_hotlist_load(const std::string & path, std::string & err) {
+    std::vector<llama_expert_slab_hotlist_entry> out;
+    FILE * f = std::fopen(path.c_str(), "r");
+    if (!f) {
+        err = "cannot open hotlist: " + path + " (" + std::strerror(errno) + ")";
+        return out;
+    }
+    char line[512];
+    while (std::fgets(line, sizeof(line), f)) {
+        // skip blank lines and comments
+        char * p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0' || *p == '\n' || *p == '#') continue;
+        llama_expert_slab_hotlist_entry e;
+        // parse <layer> <expert> <hits> <weight>
+        int n = std::sscanf(p, "%u %u %llu %lf",
+                            &e.layer, &e.expert_id,
+                            (unsigned long long *) &e.hits, &e.weight);
+        if (n >= 2) {
+            // hits/weight optional but normally present; weight defaults to 0
+            out.push_back(e);
+        }
+    }
+    std::fclose(f);
+    // ds4 hotlists are already sorted by descending weight, but enforce in case
+    // a hand-edited file isn't.
+    std::sort(out.begin(), out.end(),
+        [](const llama_expert_slab_hotlist_entry & a,
+           const llama_expert_slab_hotlist_entry & b) {
+            if (a.weight != b.weight) return a.weight > b.weight;
+            return a.hits > b.hits;
+        });
+    return out;
+}
+
+bool llama_expert_slab_cache::note_moe_selection(uint32_t layer, uint32_t expert_id) {
+    size_t slot = lookup(layer, expert_id);
+    if (slot != SIZE_MAX) {
+        prewarm_hits++;
+        return true;
+    }
+    prewarm_misses++;
+    return false;
 }
 
 

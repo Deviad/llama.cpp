@@ -56,6 +56,8 @@ set(TARGET llama-common)
 add_library(${TARGET}
     arg.cpp
     arg.h
+    expert-slab-hook.cpp
+    expert-slab-hook.h
     base64.hpp
     chat-auto-parser-generator.cpp
     chat-auto-parser-helpers.cpp
@@ -127,6 +129,7 @@ set_target_properties(${TARGET} PROPERTIES
 )
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
+target_include_directories(${TARGET} PRIVATE ../src)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (BUILD_SHARED_LIBS)

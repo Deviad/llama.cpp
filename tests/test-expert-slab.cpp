@@ -323,6 +323,96 @@ int main() {
               "reset clears prefetched_chunks de-dup map");
     }
 
+    // --------------------------------------------------------------------
+    // Test 7 (Story S4): hotlist parser + note_moe_selection hit/miss counting
+    // --------------------------------------------------------------------
+    {
+        // Write a synthetic ds4 v1 hotlist file.
+        const char * hl_path = "/tmp/s4_test_hotlist.txt";
+        FILE * hf = std::fopen(hl_path, "w");
+        CHECK(hf != nullptr, "open synthetic hotlist for write");
+        std::fputs("# ds4 expert hotlist v1\n# model GLM-5.2-test\n# layers 3\n"
+                   "# experts 4\n# layer_records 6\n# selections 1000\n"
+                   "# columns: layer expert hits weight\n"
+                   "0 1 200 0.30\n"   // hottest
+                   "1 2 150 0.22\n"
+                   "0 3 100 0.15\n"
+                   "2 0  90 0.13\n"
+                   "1 1  60 0.09\n"
+                   "2 3  40 0.06\n",
+                   hf);
+        std::fclose(hf);
+
+        std::string err;
+        auto hl = llama_expert_slab_hotlist_load(hl_path, err);
+        CHECK(err.empty(), "hotlist parser: no error on valid file");
+        CHECK(hl.size() == 6, "hotlist parser: 6 entries parsed");
+        CHECK(hl[0].layer == 0 && hl[0].expert_id == 1, "hottest entry is (L0,E1)");
+        CHECK(hl[0].weight == 0.30, "hottest entry weight=0.30");
+        CHECK(hl[1].layer == 1 && hl[1].expert_id == 2, "second entry (L1,E2)");
+        // descending weight order enforced
+        bool sorted = true;
+        for (size_t i = 1; i < hl.size(); ++i) {
+            if (hl[i].weight > hl[i-1].weight) sorted = false;
+        }
+        CHECK(sorted, "hotlist entries sorted by descending weight");
+
+        // Build a slab and pre-warm the top min(N, cache_experts)=3 entries
+        // using load_on_miss (simulates the pre-warm path that copies expert
+        // bytes from the mmap into slab slots). The slab's mmap here is a
+        // synthetic buffer (we only need lookup counting to work).
+        llama_expert_slab_cache slab;
+        slab.per_expert_bytes = 192; slab.gate_expert_bytes = 64;
+        slab.up_expert_bytes = 64; slab.down_expert_bytes = 64;
+        slab.cache_experts = 3; // pre-warm top 3
+        CHECK(slab.alloc(err), "alloc 3-slot slab for pre-warm test");
+        // Synthetic mmap (not actually read for the counting test, but
+        // load_on_miss needs a non-null base).
+        std::vector<uint8_t> fake_mmap(4096, 0xAA);
+        llama_expert_slab_cache::expert_layout lay{};
+        lay.gate_off = 0; lay.gate_stride = 64;
+        lay.up_off = 256; lay.up_stride = 64;
+        lay.down_off = 512; lay.down_stride = 64;
+        // Pre-warm top 3 entries: (0,1), (1,2), (0,3)
+        size_t loaded = 0;
+        for (size_t i = 0; i < hl.size() && loaded < slab.cache_experts; ++i) {
+            size_t s = slab.load_on_miss(hl[i].layer, hl[i].expert_id,
+                                         fake_mmap.data(), lay);
+            if (s != SIZE_MAX) { loaded++; slab.slot_ready[s] = true; }
+        }
+        slab.hotlist_entries_loaded = (uint32_t) loaded;
+        CHECK(slab.hotlist_entries_loaded == 3, "pre-warm loaded 3 of 6 hotlist entries");
+
+        // Simulate the first token's MoE selections via note_moe_selection.
+        // Suppose the first token selects these (layer, expert) pairs across
+        // its forward pass: (0,1), (0,3), (1,2), (1,0), (2,0), (0,2).
+        // Pre-warmed = {(0,1),(1,2),(0,3)} -> 3 hits, 3 misses -> 50% hit rate.
+        struct Sel { uint32_t L, E; };
+        Sel first_token_sels[] = {{0,1},{0,3},{1,2},{1,0},{2,0},{0,2}};
+        for (auto & s : first_token_sels) {
+            slab.note_moe_selection(s.L, s.E);
+        }
+        CHECK(slab.prewarm_hits == 3, "first-token: 3 pre-warm hits");
+        CHECK(slab.prewarm_misses == 3, "first-token: 3 pre-warm misses");
+        // 50% hit rate — satisfies the S4 smoke AC threshold.
+        double rate = 100.0 * (double) slab.prewarm_hits /
+                      (double)(slab.prewarm_hits + slab.prewarm_misses);
+        CHECK(rate >= 50.0, "first-token hit rate >= 50% (S4 smoke threshold)");
+
+        // Cold-start path: a fresh slab with no pre-warm has 0% hit rate but
+        // still functions (lookup returns MISS, counting still works).
+        llama_expert_slab_cache cold;
+        cold.per_expert_bytes = 192; cold.gate_expert_bytes = 64;
+        cold.up_expert_bytes = 64; cold.down_expert_bytes = 64;
+        cold.cache_experts = 4;
+        CHECK(cold.alloc(err), "alloc cold-start slab (no hotlist)");
+        cold.note_moe_selection(5, 6);
+        CHECK(cold.prewarm_hits == 0 && cold.prewarm_misses == 1,
+              "cold-start: 0 hits, 1 miss (functions without hotlist)");
+
+        std::remove(hl_path);
+    }
+
     if (failures == 0) {
         fprintf(stderr, "\nALL TESTS PASSED\n");
         return 0;

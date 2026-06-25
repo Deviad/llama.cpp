@@ -77,6 +77,30 @@ int llama_expert_slab_prefetch_willneed(const void * mmap_base, size_t offset,
                                         size_t len, uint32_t layer,
                                         const char * tag, bool trace);
 
+// --- Story S4: hotlist ingestion + pre-warm + dispatch-hook counting ---
+//
+// ds4 expert hotlist v1 format (produced by Story S6's
+// common/scripts/derive_glm52_hotlist.py from Phase 2b traces):
+//   # ds4 expert hotlist v1
+//   # model ...
+//   # layers <N>
+//   # experts <N>
+//   # layer_records <N>
+//   # selections <N>
+//   # columns: layer expert hits weight
+//   <layer> <expert> <hits> <weight>        (sorted by descending weight)
+//
+// Returns a vector of {layer, expert_id, weight} sorted by descending weight.
+// Tolerant: skips blank lines, # comments, and parses the four numeric columns.
+struct llama_expert_slab_hotlist_entry {
+    uint32_t layer     = 0;
+    uint32_t expert_id = 0;
+    uint64_t hits      = 0;
+    double   weight    = 0.0;
+};
+std::vector<llama_expert_slab_hotlist_entry>
+llama_expert_slab_hotlist_load(const std::string & path, std::string & err);
+
 struct llama_expert_slab_cache {
     // Per-expert byte geometry. For a layer L, the routed-expert tensors are
     //   blk.L.ffn_gate_exps.weight  (concatenation of n_experts gate blocks)
@@ -120,6 +144,23 @@ struct llama_expert_slab_cache {
     uint64_t n_hit  = 0;
     uint64_t n_miss = 0;
     uint64_t n_prewarm_loaded = 0;
+
+    // --- Story S4: pre-warm + dispatch-hook counting ---
+    uint32_t hotlist_entries_loaded = 0; // count of hotlist entries actually pre-warmed
+    uint64_t prewarm_hits           = 0; // lookups that HIT a pre-warmed slot
+    uint64_t prewarm_misses         = 0; // lookups that MISSed a pre-warmed slot
+    // Per-slot readiness flag (for the background-thread blocking discipline):
+    // a slot is "ready" once its pre-warm load completed. The main thread blocks
+    // on lookup() only if the slot is requested before ready==true (rare).
+    std::vector<bool> slot_ready;
+
+    // Record a MoE expert-selection event (one expert chosen for one token on
+    // one layer). Counts HIT/MISS against the slab's current contents.
+    // Returns true if the selected expert was a HIT (already resident).
+    // This is the cb_eval hook entry point: the caller (installed as
+    // params.cb_eval) reads the ffn_moe_topk tensor, extracts the selected
+    // expert ids, and calls this for each (layer, expert_id) pair.
+    bool note_moe_selection(uint32_t layer, uint32_t expert_id);
 
     // --- Story S3: prefill-madvise de-dup ---
     // Tracks which (layer, prefill-chunk) pairs have already been hinted so

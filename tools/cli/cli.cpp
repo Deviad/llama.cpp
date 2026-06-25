@@ -3,6 +3,7 @@
 #include "arg.h"
 #include "console.h"
 #include "fit.h"
+#include "expert-slab-hook.h" // Story S4: routed-expert SSD streaming hook
 // #include "log.h"
 
 #include "server-common.h"
@@ -410,6 +411,21 @@ int llama_cli(int argc, char ** argv) {
 
     console::log("\nLoading model... "); // followed by loading animation
     console::spinner::start();
+
+    // Story S4 (LLAMACPP_GLM52_ENHANCEMENT_PLAN.md): install the routed-expert
+    // SSD streaming slab hook before model load so params.cb_eval is plumbed
+    // into the context at creation time. Default-off (no-op when
+    // --streaming-cache-experts is 0); beast-mode parity preserved.
+    std::unique_ptr<llama_expert_slab_hook_state> slab_hook;
+    {
+        std::string hook_err;
+        if (!llama_expert_slab_hook_install(params, slab_hook, hook_err)) {
+            console::spinner::stop();
+            console::error("\nFailed to install expert-slab hook: %s\n", hook_err.c_str());
+            return 1;
+        }
+    }
+
     if (!ctx_cli.ctx_server.load_model(params)) {
         console::spinner::stop();
         console::error("\nFailed to load the model\n");
@@ -674,6 +690,10 @@ int llama_cli(int argc, char ** argv) {
 
     // bump the log level to display timings
     common_log_set_verbosity_thold(LOG_LEVEL_INFO);
+
+    // Story S4: print the expert-slab summary (hit rate, pre-warm coverage).
+    llama_expert_slab_hook_finalize(slab_hook);
+
     common_memory_breakdown_print(ctx_cli.ctx_server.get_llama_context());
 
     return 0;
