@@ -154,13 +154,32 @@ struct llama_expert_slab_cache {
     // on lookup() only if the slot is requested before ready==true (rare).
     std::vector<bool> slot_ready;
 
+    // --- Story S5: runtime hotlist writeback ---
+    // Per-(layer, expert) selection counts accumulated during inference.
+    // O(1) increment per event, no hot-path allocation. Indexed as
+    // selection_counts[layer * n_experts_table + expert]. Sized to
+    // (max_layer_seen+1) * n_experts_table when the hook resolves geometry.
+    // When --hotlist-out is set, hotlist_save() writes this table in ds4 v1
+    // format at shutdown — closing the loop with S4's --hotlist loader.
+    uint32_t n_experts_table = 0;     // stride (>0 enables recording)
+    std::vector<uint64_t> selection_counts; // size = (n_layers * n_experts_table)
+    bool     writeback_enabled = false;     // true if --hotlist-out set
+
     // Record a MoE expert-selection event (one expert chosen for one token on
-    // one layer). Counts HIT/MISS against the slab's current contents.
+    // one layer). Counts HIT/MISS against the slab's current contents AND
+    // (Story S5) increments selection_counts[layer, expert] for writeback.
     // Returns true if the selected expert was a HIT (already resident).
     // This is the cb_eval hook entry point: the caller (installed as
     // params.cb_eval) reads the ffn_moe_topk tensor, extracts the selected
     // expert ids, and calls this for each (layer, expert_id) pair.
     bool note_moe_selection(uint32_t layer, uint32_t expert_id);
+
+    // --- Story S5: write the measured hotlist ---
+    // Writes selection_counts to `path` in ds4 expert hotlist v1 format (same
+    // as S4's --hotlist loader), sorted by descending hits. Zero-count
+    // entries are skipped. Returns true on success (err set on failure).
+    // Safe to call when writeback is disabled (writes an empty hotlist header).
+    bool hotlist_save(const std::string & path, std::string & err) const;
 
     // --- Story S3: prefill-madvise de-dup ---
     // Tracks which (layer, prefill-chunk) pairs have already been hinted so

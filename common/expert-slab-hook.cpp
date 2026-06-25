@@ -170,6 +170,22 @@ bool llama_expert_slab_hook_install(common_params & params,
         scan_shard_for_expert_tensors(sp, st->layers);
     }
     if (n_experts == 0) n_experts = 256; // GLM-5.2 default fallback
+    // ---- Story S5: size + enable the runtime-writeback table ----
+    st->slab->n_experts_table = (uint32_t) n_experts;
+    st->hotlist_out_path      = params.streaming_hotlist_out;
+    st->slab->writeback_enabled = !params.streaming_hotlist_out.empty();
+    if (st->slab->writeback_enabled) {
+        // size to (max_scanned_layer + 1) * n_experts; layers without selections
+        // contribute zero rows at save time. cap max_layer at a sane value
+        // (e.g. 9999) so a malformed GGUF can't blow up memory.
+        uint32_t max_layer = 0;
+        for (const auto & kv : st->layers) max_layer = std::max(max_layer, kv.first);
+        if (max_layer < 9999) {
+            st->slab->selection_counts.assign((size_t)(max_layer + 1) * n_experts, 0);
+        } else {
+            st->slab->writeback_enabled = false;
+        }
+    }
     // resolve per-expert byte strides for each layer's fragments
     for (auto & kv : st->layers) {
         auto & lay = kv.second;
@@ -306,6 +322,16 @@ bool llama_expert_slab_hook_install(common_params & params,
 
 void llama_expert_slab_hook_finalize(const std::unique_ptr<llama_expert_slab_hook_state> & state) {
     if (!state || !state->slab) return;
+    // Story S5: write the measured hotlist before printing the summary.
+    if (state->slab->writeback_enabled && !state->hotlist_out_path.empty()) {
+        std::string err;
+        if (state->slab->hotlist_save(state->hotlist_out_path, err)) {
+            fprintf(stderr, "expert-slab hook: wrote measured hotlist to %s\n",
+                    state->hotlist_out_path.c_str());
+        } else {
+            fprintf(stderr, "expert-slab hook: hotlist writeback FAILED: %s\n", err.c_str());
+        }
+    }
     fprintf(stderr, "%s: ", __func__);
     state->slab->print_summary("final");
 }

@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <fstream>
 #include <vector>
 
 static int failures = 0;
@@ -411,6 +412,59 @@ int main() {
               "cold-start: 0 hits, 1 miss (functions without hotlist)");
 
         std::remove(hl_path);
+    }
+
+    // ---- Story S5: runtime hotlist writeback + closed loop ----
+    {
+        std::string err; // local error sink for this block's CHECK()/save calls
+        // Setup: enable writeback on a small slab, record selections,
+        // writeback in ds4 v1, then reload and verify counts survive round-trip.
+        llama_expert_slab_cache wb;
+        wb.per_expert_bytes = 192; wb.gate_expert_bytes = 64;
+        wb.up_expert_bytes = 64; wb.down_expert_bytes = 64;
+        wb.cache_experts = 8;
+        CHECK(wb.alloc(err), "S5: alloc slab for writeback");
+        // Size the writeback table: 4 layers x 16 experts.
+        wb.n_experts_table  = 16;
+        wb.writeback_enabled = true;
+        wb.selection_counts.assign(4 * 16, 0);
+        // Record 5 selection events: (L2,E5), (L2,E5), (L2,E5), (L1,E9), (L3,E0).
+        wb.note_moe_selection(2, 5); // L2E5 -> count 1
+        wb.note_moe_selection(2, 5); // L2E5 -> count 2
+        wb.note_moe_selection(2, 5); // L2E5 -> count 3
+        wb.note_moe_selection(1, 9); // L1E9 -> count 1
+        wb.note_moe_selection(3, 0); // L3E0 -> count 1
+        // Total selections must match the sum
+        CHECK(wb.selection_counts[2*16 + 5] == 3, "S5: L2E5 counted 3 times");
+        CHECK(wb.selection_counts[1*16 + 9] == 1, "S5: L1E9 counted 1 time");
+        CHECK(wb.selection_counts[3*16 + 0] == 1, "S5: L3E0 counted 1 time");
+
+        // Writeback to disk in ds4 v1 format.
+        const char * wb_path = "/tmp/test_expert_slab_s5_hotlist.txt";
+        std::remove(wb_path);
+        CHECK(wb.hotlist_save(wb_path, err), "S5: hotlist_save writes without error");
+
+        // Verify the file header + sorted-by-descending-hits rows.
+        std::ifstream f(wb_path);
+        std::string line; bool saw_header = false;
+        std::vector<std::string> rows;
+        while (std::getline(f, line)) {
+            if (line.rfind("# ds4 expert hotlist v1", 0) == 0) saw_header = true;
+            if (!line.empty() && line[0] != '#' && line[0] != ' ') rows.push_back(line);
+        }
+        CHECK(saw_header, "S5: written hotlist has ds4 v1 header");
+        // exact rows present, counted events with count>0 only
+        CHECK(rows.size() == 3, "S5: writeback emits only nonzero (layer,expert) pairs");
+        // rows are sorted by descending hits: 3,1,1
+        CHECK(rows[0].rfind("2 5 3", 0) == 0, "S5: row 0 sorted-by-hits = (L2,E5,3)");
+
+        // Closed loop: reload the written hotlist; counts survive round-trip.
+        auto reloaded = llama_expert_slab_hotlist_load(wb_path, err);
+        CHECK(reloaded.size() == 3, "S5: reloaded hotlist has same nonzero row count");
+        CHECK(reloaded[0].layer == 2 && reloaded[0].expert_id == 5 &&
+              reloaded[0].hits == 3, "S5: first row round-trips (L2,E5,3)");
+
+        std::remove(wb_path);
     }
 
     if (failures == 0) {

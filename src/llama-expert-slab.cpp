@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <tuple>
+#include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
 #  include <sys/mman.h>   // mlock, munlock
@@ -342,6 +344,15 @@ llama_expert_slab_hotlist_load(const std::string & path, std::string & err) {
 }
 
 bool llama_expert_slab_cache::note_moe_selection(uint32_t layer, uint32_t expert_id) {
+    // --- Story S5: O(1) per-(layer,expert) selection-count increment ---
+    // No allocation in the hot path. writeback_enabled is a compile-time-ish
+    // branch predictor; n_experts_table guards the table sizing.
+    if (writeback_enabled && n_experts_table > 0) {
+        size_t idx = (size_t) layer * (size_t) n_experts_table + (size_t) expert_id;
+        if (idx < selection_counts.size()) {
+            selection_counts[idx]++;
+        }
+    }
     size_t slot = lookup(layer, expert_id);
     if (slot != SIZE_MAX) {
         prewarm_hits++;
@@ -349,6 +360,55 @@ bool llama_expert_slab_cache::note_moe_selection(uint32_t layer, uint32_t expert
     }
     prewarm_misses++;
     return false;
+}
+
+bool llama_expert_slab_cache::hotlist_save(const std::string & path, std::string & err) const {
+    FILE * f = std::fopen(path.c_str(), "wb");
+    if (!f) { err = "cannot open for write: " + path; return false; }
+    // ds4 expert hotlist v1 format (matches the loader):
+    //   # ds4 expert hotlist v1
+    //   # model <model-name-ish placeholder>
+    //   # layers <n_layers>
+    //   # experts <n_experts_table>
+    //   # layer_records <N nonzero rows>
+    //   # selections <sum of hits>
+    //   # columns: layer expert hits weight
+    //   <layer> <expert> <hits> <weight>
+    //   (sorted by descending hits / weight)
+    uint32_t n_layers_seen = (uint32_t)(selection_counts.size() / (n_experts_table ? n_experts_table : 1));
+    uint64_t total = 0;
+    uint64_t n_rows = 0;
+    std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> rows;
+    if (n_experts_table > 0) {
+        rows.reserve(selection_counts.size());
+        for (uint32_t L = 0; L < n_layers_seen; ++L) {
+            for (uint32_t E = 0; E < n_experts_table; ++E) {
+                uint64_t c = selection_counts[(size_t) L * n_experts_table + E];
+                if (c == 0) continue;
+                rows.emplace_back(L, E, c);
+                total += c;
+                n_rows++;
+            }
+        }
+        std::sort(rows.begin(), rows.end(),
+            [](const auto & a, const auto & b) { return std::get<2>(a) > std::get<2>(b); });
+    }
+    std::fprintf(f, "# ds4 expert hotlist v1\n");
+    std::fprintf(f, "# model GLM-5.2-runtime-written\n");
+    std::fprintf(f, "# layers %u\n", n_layers_seen);
+    std::fprintf(f, "# experts %u\n", n_experts_table);
+    std::fprintf(f, "# layer_records %llu\n", (unsigned long long) n_rows);
+    std::fprintf(f, "# selections %llu\n", (unsigned long long) total);
+    std::fprintf(f, "# columns: layer expert hits weight\n");
+    double tot_d = (double) total;
+    for (const auto & r : rows) {
+        uint32_t L, E; uint64_t H;
+        std::tie(L, E, H) = r;
+        double w = (tot_d > 0.0) ? (double) H / tot_d : 0.0;
+        std::fprintf(f, "%u %u %llu %.6f\n", L, E, (unsigned long long) H, w);
+    }
+    std::fclose(f);
+    return true;
 }
 
 

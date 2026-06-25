@@ -63,6 +63,8 @@ struct llama_expert_slab_hook_state {
     std::unordered_map<uint32_t, layer_expert_layout> layers;
     std::atomic<bool> prewarm_done{false};
     std::thread prewarm_thread;
+    // Story S5: path to write the measured hotlist at shutdown ("" = no write).
+    std::string hotlist_out_path;
 };
 
 // Opaque hook state (defined in the .cpp).
