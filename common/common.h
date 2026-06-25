@@ -477,6 +477,7 @@ struct common_params {
     size_t streaming_cache_bytes   = 0; // 0 = size from plan_cache; else explicit budget
     std::string streaming_hotlist;      // path to '# ds4 expert hotlist v1' file (Story S4)
     std::string streaming_hotlist_out;  // path to write measured hotlist at exit (Story S5)
+    bool        trace_prefetch = false; // Story S3: log each posix_madvise(WILLNEED) hint
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;

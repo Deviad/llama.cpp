@@ -277,6 +277,52 @@ int main() {
         slab3.reset();
     }
 
+    // --------------------------------------------------------------------
+    // Test 6 (Story S3): per-region madvise(WILLNEED) helper + de-dup
+    // --------------------------------------------------------------------
+    {
+        // The helper is a no-op safe call on any posix host (returns 0 on
+        // success or no-op; nonzero only on posix_madvise failure, which we
+        // don't expect for a valid in-range pointer).
+        uint8_t buf[4096];
+        std::memset(buf, 0, sizeof(buf));
+        int rc = llama_expert_slab_prefetch_willneed(buf, 0, sizeof(buf),
+                                                      7, "prefill", true);
+        CHECK(rc == 0, "prefetch_willneed returns 0 on a valid buffer");
+
+        // null base + zero len -> no-op, returns 0 (no dereference).
+        CHECK(llama_expert_slab_prefetch_willneed(nullptr, 0, 0, 0, "x", false) == 0,
+              "prefetch_willneed null/empty is a no-op returning 0");
+
+        // De-dup discipline via the slab's prefetch_one(): a (layer, chunk)
+        // pair is hinted exactly once; the second call is a de-dup no-op.
+        llama_expert_slab_cache slab;
+        slab.per_expert_bytes = 64; slab.gate_expert_bytes = 64;
+        slab.up_expert_bytes = 0; slab.down_expert_bytes = 0;
+        slab.cache_experts = 1;
+        std::string err;
+        CHECK(slab.alloc(err), "alloc slab for prefetch de-dup test");
+        slab.trace_prefetch = false; // quiet
+        // First hint for (layer=3, chunk=0) -> issues, returns true.
+        CHECK(slab.prefetch_one(buf, 0, 4096, 3, 0, "prefill"),
+              "first prefetch_one(L=3,chunk=0) issues a hint");
+        // Second hint for the same pair -> de-duped, returns false.
+        CHECK(!slab.prefetch_one(buf, 0, 4096, 3, 0, "prefill"),
+              "second prefetch_one(L=3,chunk=0) is de-duped (returns false)");
+        // Different chunk index for same layer -> issues a new hint.
+        CHECK(slab.prefetch_one(buf, 0, 4096, 3, 1, "prefill"),
+              "prefetch_one(L=3,chunk=1) issues a hint (different chunk)");
+        // Different layer, same chunk -> issues a new hint.
+        CHECK(slab.prefetch_one(buf, 0, 4096, 4, 0, "prefill"),
+              "prefetch_one(L=4,chunk=0) issues a hint (different layer)");
+        // After 3 distinct (layer, chunk) pairs, the map should have 3 entries.
+        CHECK(slab.prefetched_chunks.size() == 3,
+              "prefetched_chunks map has exactly 3 entries after 3 distinct hints");
+        slab.reset();
+        CHECK(slab.prefetched_chunks.empty(),
+              "reset clears prefetched_chunks de-dup map");
+    }
+
     if (failures == 0) {
         fprintf(stderr, "\nALL TESTS PASSED\n");
         return 0;

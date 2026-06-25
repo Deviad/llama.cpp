@@ -50,6 +50,33 @@ static constexpr double LLAMA_EXPERT_SLAB_BUDGET_FRACTION = 7.0 / 10.0;
 // Exposed so callers (CLI flag handler, slab planning) can apply the 7/10 rule.
 size_t llama_expert_slab_recommended_working_set_bytes();
 
+// --- Story S3: per-region madvise(WILLNEED) at prefill granularity ---
+//
+// llama-mmap.cpp already hints the *whole* weight file with POSIX_MADV_WILLNEED
+// at mmap time (line 463) and then POSIX_MADV_RANDOM. That's a coarse prefetch.
+// S3 adds a scoped helper that hints a *single layer's routed-expert span*
+// ahead of that layer's FFN compute, so SSD read latency overlaps with the
+// preceding layer's compute rather than stalling it.
+//
+// The helper is intentionally freestanding (does not touch the slab cache) —
+// it operates on the model's weight mmap address directly. Live invocation
+// from the prefill path is wired in Story S4 (the dispatch hook installation);
+// S3 lands the helper + the --trace-prefetch debug flag + a unit test, matching
+// the S1/S2 pattern of landing the data-structure layer before the live hook.
+//
+// `mmap_base` is the model weight mmap address (same pointer llama-mmap
+// exposes via `llama_mmap::addr()`). `offset`/`len` describe the byte span of
+// one layer's routed-expert region within that mmap. `layer` is the layer
+// index (only used for the --trace-prefetch log line). `tag` is a short label
+// for the log (e.g. "prefill" / "decode-warmup"). Returns 0 on success, errno
+// on posix_madvise failure (caller decides whether to warn).
+//
+// Compile-guarded: on platforms without POSIX_MADV_WILLNEED this is a no-op
+// returning 0, so callers can invoke it unconditionally.
+int llama_expert_slab_prefetch_willneed(const void * mmap_base, size_t offset,
+                                        size_t len, uint32_t layer,
+                                        const char * tag, bool trace);
+
 struct llama_expert_slab_cache {
     // Per-expert byte geometry. For a layer L, the routed-expert tensors are
     //   blk.L.ffn_gate_exps.weight  (concatenation of n_experts gate blocks)
@@ -93,6 +120,21 @@ struct llama_expert_slab_cache {
     uint64_t n_hit  = 0;
     uint64_t n_miss = 0;
     uint64_t n_prewarm_loaded = 0;
+
+    // --- Story S3: prefill-madvise de-dup ---
+    // Tracks which (layer, prefill-chunk) pairs have already been hinted so
+    // the WILLNEED advisory is issued exactly once per pair (no re-hinting on
+    // decode tokens, which read from the slab, not the mmap). Key is
+    // (uint64_t(layer) << 32) | chunk_index. S4 wires the live invocation;
+    // S3 just provides the bookkeeping + the prefetch_one() driver.
+    std::unordered_map<uint64_t, bool> prefetched_chunks;
+    bool trace_prefetch = false; // set from --trace-prefetch
+
+    // Issue posix_madvise(WILLNEED) for one layer's expert span, but only the
+    // first time this (layer, chunk) pair is seen. Returns true if a hint was
+    // actually issued, false if it was de-duped (already hinted) or no-op'd.
+    bool prefetch_one(const void * mmap_base, size_t offset, size_t len,
+                      uint32_t layer, uint32_t chunk_index, const char * tag);
 
     // --- construction / teardown ---
     llama_expert_slab_cache() = default;

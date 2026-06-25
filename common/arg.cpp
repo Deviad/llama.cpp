@@ -2315,6 +2315,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_STREAMING_HOTLIST_OUT"));
     add_opt(common_arg(
+        {"--trace-prefetch"},
+        "log each posix_madvise(WILLNEED) hint issued for routed-expert regions ahead of FFN compute (Story S3). "
+        "Prints '<tag> layer=<L> offset=<O> len=<N> addr=<p> rc=<r>' per hint. Use to verify hints lead (not lag) the compute.",
+        [](common_params & params) {
+            params.trace_prefetch = true;
+        }
+    ).set_env("LLAMA_ARG_TRACE_PREFETCH"));
+    add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},
         string_format("use DirectIO if available. (default: %s)", params.use_direct_io ? "enabled" : "disabled"),

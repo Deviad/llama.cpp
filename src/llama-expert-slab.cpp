@@ -62,6 +62,7 @@ void llama_expert_slab_cache::reset() {
     }
     mlocked = false;
     mlocked_bytes = 0;
+    prefetched_chunks.clear();
     if (slab) {
         std::free(slab);
         slab = nullptr;
@@ -176,6 +177,25 @@ uint8_t * llama_expert_slab_cache::slot_ptr(size_t slot_idx) {
     return slab + slot_idx * per_expert_bytes;
 }
 
+bool llama_expert_slab_cache::prefetch_one(const void * mmap_base, size_t offset,
+                                          size_t len, uint32_t layer,
+                                          uint32_t chunk_index, const char * tag) {
+    uint64_t key = make_key(layer, chunk_index);
+    auto it = prefetched_chunks.find(key);
+    if (it != prefetched_chunks.end() && it->second) {
+        // Already hinted this (layer, chunk) pair — de-dup (decode tokens don't
+        // re-hint; decode reads go through the slab, not the mmap).
+        return false;
+    }
+    int rc = llama_expert_slab_prefetch_willneed(
+        mmap_base, offset, len, layer, tag, trace_prefetch);
+    if (rc == 0) {
+        prefetched_chunks[key] = true;
+        return true;
+    }
+    return false;
+}
+
 void llama_expert_slab_cache::print_summary(const char * label) const {
     if (label) {
         fprintf(stderr, "%s: ", label);
@@ -245,6 +265,34 @@ bool llama_expert_slab_cache::alloc_locked(size_t budget_bytes_in, std::string &
     }
     return true;
 }
+
+int llama_expert_slab_prefetch_willneed(const void * mmap_base, size_t offset,
+                                        size_t len, uint32_t layer,
+                                        const char * tag, bool trace) {
+    if (mmap_base == nullptr || len == 0) {
+        return 0; // nothing to hint
+    }
+#if defined(POSIX_MADV_WILLNEED) && (defined(__unix__) || defined(__APPLE__))
+    const uint8_t * p = static_cast<const uint8_t *>(mmap_base) + offset;
+    int rc = posix_madvise(const_cast<uint8_t *>(p), len, POSIX_MADV_WILLNEED);
+    if (trace) {
+        fprintf(stderr,
+            "expert-slab prefetch: %s layer=%u offset=%zu len=%zu addr=%p rc=%d %s\n",
+            tag ? tag : "?", (unsigned) layer, offset, len, (const void *) p,
+            rc, rc == 0 ? "ok" : std::strerror(rc));
+    }
+    return rc;
+#else
+    // Platform without POSIX_MADV_WILLNEED — silent no-op (compile-guard).
+    if (trace) {
+        fprintf(stderr,
+            "expert-slab prefetch: %s layer=%u offset=%zu len=%zu (no-op: POSIX_MADV_WILLNEED unavailable)\n",
+            tag ? tag : "?", (unsigned) layer, offset, len);
+    }
+    return 0;
+#endif
+}
+
 
 size_t llama_expert_slab_plan_cache(
     size_t recommended_working_set_bytes,
