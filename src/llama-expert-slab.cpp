@@ -9,6 +9,39 @@
 #include <cstring>
 #include <algorithm>
 
+#if defined(__unix__) || defined(__APPLE__)
+#  include <sys/mman.h>   // mlock, munlock
+#  include <unistd.h>    // sysconf(_SC_PAGESIZE)
+#endif
+
+#include "ggml-backend.h" // ggml_backend_dev_get/count, ggml_backend_dev_memory
+
+
+size_t llama_expert_slab_recommended_working_set_bytes() {
+    // Iterate registered backend devices; take the largest GPU-class device's
+    // memory_total. On Apple Silicon the Metal device reports MTLDevice
+    // .recommendedMaxWorkingSetSize here (see ggml-metal-device.m:853). On
+    // non-Metal hosts the GPU device's memory_total is the VRAM ceiling.
+    size_t best = 0;
+    const int n_dev = (int) ggml_backend_dev_count();
+    for (int i = 0; i < n_dev; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_dev_memory(dev, &free_b, &total_b);
+        if (total_b > best) best = total_b;
+    }
+    if (best == 0) {
+        // No GPU-class device found; fall back to a conservative 16 GiB host
+        // default so the 7/10 rule still produces a nonzero plan.
+        best = 16ULL * 1024 * 1024 * 1024;
+        fprintf(stderr,
+            "expert-slab: no GPU backend device found; using 16 GiB fallback for recommended_working_set\n");
+    }
+    return best;
+}
+
+
 static uint64_t make_key(uint32_t layer, uint32_t expert_id) {
     return (uint64_t(layer) << 32) | uint32_t(expert_id);
 }
@@ -18,6 +51,17 @@ llama_expert_slab_cache::~llama_expert_slab_cache() {
 }
 
 void llama_expert_slab_cache::reset() {
+    // Story S2: if the slab was chunked-mlock'd, release the lock first.
+    if (slab && mlocked && mlocked_bytes > 0) {
+        size_t chunk = LLAMA_EXPERT_SLAB_MLOCK_CHUNK;
+        for (size_t off = 0; off < mlocked_bytes; off += chunk) {
+            size_t n = std::min(chunk, mlocked_bytes - off);
+            // munlock is best-effort; ignore failures during teardown.
+            (void) munlock(slab + off, n);
+        }
+    }
+    mlocked = false;
+    mlocked_bytes = 0;
     if (slab) {
         std::free(slab);
         slab = nullptr;
@@ -138,11 +182,68 @@ void llama_expert_slab_cache::print_summary(const char * label) const {
     }
     fprintf(stderr,
         "expert-slab: per_expert_bytes=%zu (gate=%zu up=%zu down=%zu) "
-        "cache_experts=%zu slab_bytes=%zu hits=%llu misses=%llu prewarm=%llu\n",
+        "cache_experts=%zu slab_bytes=%zu hits=%llu misses=%llu prewarm=%llu "
+        "mlocked=%s mlocked_bytes=%zu budget_bytes=%zu (chunk=%zuMiB)\n",
         per_expert_bytes, gate_expert_bytes, up_expert_bytes, down_expert_bytes,
         cache_experts, slab_bytes,
         (unsigned long long) n_hit, (unsigned long long) n_miss,
-        (unsigned long long) n_prewarm_loaded);
+        (unsigned long long) n_prewarm_loaded,
+        mlocked ? "yes" : "no", mlocked_bytes, budget_bytes,
+        LLAMA_EXPERT_SLAB_MLOCK_CHUNK / (1024*1024));
+}
+
+bool llama_expert_slab_cache::alloc_locked(size_t budget_bytes_in, std::string & err) {
+    budget_bytes = budget_bytes_in;
+    // First do the plain allocation (posix_memalign + zero).
+    if (!alloc(err)) {
+        return false;
+    }
+    if (budget_bytes == 0) {
+        // No mlock requested — leave as a normal heap allocation.
+        fprintf(stderr, "expert-slab: mlock disabled (budget_bytes=0); slab is ordinary heap\n");
+        return true;
+    }
+    // Cap the locked prefix at min(slab_bytes, budget_bytes).
+    size_t want = std::min(slab_bytes, budget_bytes);
+    // Touch every page and mlock in 256 MiB chunks.
+    size_t page = 4096; // posix_memalign already gave us 4096-aligned base
+    size_t chunk = LLAMA_EXPERT_SLAB_MLOCK_CHUNK;
+    for (size_t off = 0; off < want; off += chunk) {
+        size_t n = std::min(chunk, want - off);
+        uint8_t * p = slab + off;
+        // Touch every page in this chunk with the ds4 write pattern p[pos]=pos/page.
+        // This forces physical commitment before mlock so the kernel doesn't fail
+        // on a COW zero page that hasn't been faulted in.
+        for (size_t pos = 0; pos < n; pos += page) {
+            p[pos] = (uint8_t)((pos / page) & 0xff);
+        }
+        if (mlock(p, n) != 0) {
+            // Mid-chunk failure: roll back the already-locked prefix and fall back.
+            int saved = errno;
+            fprintf(stderr,
+                "expert-slab: mlock failed at offset %zu (chunk %zu, errno=%d: %s); "
+                "rolling back %zu bytes and falling back to non-locked heap\n",
+                off, n, saved, std::strerror(saved), mlocked_bytes);
+            for (size_t o2 = 0; o2 < mlocked_bytes; o2 += chunk) {
+                size_t n2 = std::min(chunk, mlocked_bytes - o2);
+                (void) munlock(slab + o2, n2);
+            }
+            mlocked = false;
+            mlocked_bytes = 0;
+            // Keep the heap slab (caller still has a working cache, just unlocked).
+            fprintf(stderr,
+                "expert-slab: fallback to non-locked heap (slab may be paged out under pressure)\n");
+            return true; // allocation itself succeeded; mlock is best-effort
+        }
+        mlocked_bytes += n;
+    }
+    mlocked = (mlocked_bytes > 0);
+    if (mlocked && mlocked_bytes < slab_bytes) {
+        fprintf(stderr,
+            "expert-slab: locked %zu of %zu slab bytes (budget cap); tail %zu bytes unlocked\n",
+            mlocked_bytes, slab_bytes, slab_bytes - mlocked_bytes);
+    }
+    return true;
 }
 
 size_t llama_expert_slab_plan_cache(

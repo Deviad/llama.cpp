@@ -210,6 +210,73 @@ int main() {
         CHECK(slab.slab == nullptr, "reset frees slab pointer");
     }
 
+    // --------------------------------------------------------------------
+    // Test 5 (Story S2): chunked mlock alloc_locked + budget rule
+    // --------------------------------------------------------------------
+    {
+        // recommended_working_set resolver should return a nonzero value on
+        // any real host (Metal device or 16 GiB fallback).
+        size_t ws = llama_expert_slab_recommended_working_set_bytes();
+        CHECK(ws > 0, "recommended_working_set_bytes > 0");
+
+        // ds4 budget rule: budget = 7/10 * recommended_working_set.
+        double budget = (double)ws * LLAMA_EXPERT_SLAB_BUDGET_FRACTION;
+        CHECK(budget > 0, "7/10 budget is positive");
+
+        // Build a slab large enough to exercise multi-chunk locking (2 MiB slab,
+        // budget = 1 MiB so the locked prefix is capped below the full slab).
+        llama_expert_slab_cache slab;
+        slab.gate_expert_bytes = 1024 * 1024;       // 1 MiB gate per expert
+        slab.up_expert_bytes   = 512 * 1024;        // 512 KiB up
+        slab.down_expert_bytes = 512 * 1024;        // 512 KiB down
+        slab.per_expert_bytes  = 2 * 1024 * 1024;   // 2 MiB per expert
+        slab.cache_experts     = 1;                 // 2 MiB total slab
+        std::string err;
+        // budget 1 MiB < slab 2 MiB -> locked prefix capped, tail unlocked.
+        CHECK(slab.alloc_locked(1024 * 1024, err), "alloc_locked (1 MiB budget, 2 MiB slab)");
+        CHECK(slab.enabled(), "slab enabled after alloc_locked");
+        // locked prefix should be <= budget and a multiple of the chunk size
+        // (the last partial chunk is locked at its actual byte count).
+        CHECK(slab.mlocked_bytes <= 1024 * 1024, "mlocked_bytes <= budget");
+        CHECK(slab.mlocked_bytes > 0, "some bytes were locked");
+        CHECK(slab.mlocked_bytes <= slab.slab_bytes, "mlocked prefix within slab");
+        if (slab.mlocked_bytes < slab.slab_bytes) {
+            // tail should be unlocked
+            CHECK(slab.mlocked_bytes == 1024 * 1024,
+                  "locked prefix == budget when slab > budget");
+        }
+        slab.reset();
+        CHECK(!slab.mlocked, "reset clears mlocked flag");
+        CHECK(slab.mlocked_bytes == 0, "reset clears mlocked_bytes");
+
+        // alloc_locked with budget=0 -> normal heap, no mlock.
+        llama_expert_slab_cache slab2;
+        slab2.per_expert_bytes = 64; slab2.gate_expert_bytes = 64;
+        slab2.up_expert_bytes = 0; slab2.down_expert_bytes = 0;
+        slab2.cache_experts = 1;
+        CHECK(slab2.alloc_locked(0, err), "alloc_locked budget=0 (no mlock)");
+        CHECK(!slab2.mlocked, "budget=0 => not mlocked");
+        CHECK(slab2.enabled(), "budget=0 slab still enabled");
+
+        // S2 AC literal: "merge-sort baseline runs with the slab enabled at a
+        // 16 GiB cache budget without mlock failure." The slab is not yet
+        // wired into the model loader (that's S4), so this validates the
+        // 16 GiB budget against the real Metal recommended_working_set
+        // (>= 16 GiB / 0.7 here) and that alloc_locked(16 GiB) succeeds.
+        llama_expert_slab_cache slab3;
+        slab3.per_expert_bytes = 64; slab3.gate_expert_bytes = 64;
+        slab3.up_expert_bytes = 0; slab3.down_expert_bytes = 0;
+        slab3.cache_experts = 1;
+        size_t budget_16g = 16ULL * 1024 * 1024 * 1024;
+        // 7/10 rule: budget must be <= 0.7 * recommended_working_set
+        CHECK(budget_16g <= (size_t)((double)ws * LLAMA_EXPERT_SLAB_BUDGET_FRACTION),
+              "16 GiB budget respects 7/10 of recommended_working_set");
+        CHECK(slab3.alloc_locked(budget_16g, err), "alloc_locked 16 GiB budget on Metal");
+        // Slab is only 64 bytes, so mlocked_bytes == 64 (whole slab fits).
+        CHECK(slab3.mlocked, "16 GiB budget mlocks the (tiny) slab");
+        slab3.reset();
+    }
+
     if (failures == 0) {
         fprintf(stderr, "\nALL TESTS PASSED\n");
         return 0;

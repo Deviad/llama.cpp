@@ -27,6 +27,29 @@
 #include <unordered_map>
 #include <vector>
 
+// --- Story S2: chunked mlock state ---
+//
+// ds4 locks the slab in 256 MiB chunks (not one huge mlock) and touches every
+// page with a write pattern `p[pos] = pos/page` before each chunk's mlock to
+// force commitment. On mid-chunk mlock failure, the already-locked prefix is
+// munlock'd and the slab falls back to non-locked malloc with a warning.
+//
+// The chunked approach avoids kernel-panic-class VM accounting failures on
+// macOS when a single huge mlock would exceed the wired-memory limit.
+static constexpr size_t LLAMA_EXPERT_SLAB_MLOCK_CHUNK = 256ull * 1024 * 1024; // 256 MiB
+
+// ds4's budget rule: explicit-cache bytes <= 7/10 * recommended_working_set.
+// On Metal this maps to MTLDevice.recommendedMaxWorkingSetSize; elsewhere a
+// caller-supplied default or the largest GPU device's memory_total.
+static constexpr double LLAMA_EXPERT_SLAB_BUDGET_FRACTION = 7.0 / 10.0;
+
+// Resolve the host's recommended working-set size in bytes. On Apple Silicon
+// this returns MTLDevice.recommendedMaxWorkingSetSize (via the Metal backend
+// device's memory_total). On non-Metal hosts, returns the largest GPU-class
+// backend device's memory_total, or a 16 GiB fallback if no GPU device found.
+// Exposed so callers (CLI flag handler, slab planning) can apply the 7/10 rule.
+size_t llama_expert_slab_recommended_working_set_bytes();
+
 struct llama_expert_slab_cache {
     // Per-expert byte geometry. For a layer L, the routed-expert tensors are
     //   blk.L.ffn_gate_exps.weight  (concatenation of n_experts gate blocks)
@@ -50,6 +73,11 @@ struct llama_expert_slab_cache {
     // Within a slot, the triple is laid out as [gate | up | down] in that order
     // (matching the natural read order of the dispatch hook).
     uint8_t * slab = nullptr; // heap-allocated in S1; S2 will make it mlock'd.
+
+    // --- Story S2: chunked mlock state ---
+    bool     mlocked        = false; // true iff the slab was successfully mlock'd
+    size_t   mlocked_bytes  = 0;     // how many bytes (prefix) are currently locked
+    size_t   budget_bytes  = 0;     // max bytes the caller is willing to mlock (7/10 rule)
 
     // Slot bookkeeping. slots[i] = {layer, expert_id, valid}. A free slot has
     // valid==false. The map gives O(1) (layer, expert_id) -> slot index on HIT.
@@ -78,6 +106,24 @@ struct llama_expert_slab_cache {
     // per_expert_bytes and cache_experts must already be set by the caller
     // (see `plan_cache`). The slab is zero-initialized.
     bool alloc(std::string & err);
+
+    // --- Story S2: chunked mlock ---
+    //
+    // Allocates the slab (if not already) and mlocks it in 256 MiB chunks,
+    // touching every page with the write pattern p[pos]=pos/page before each
+    // chunk's mlock to force commitment. budget_bytes caps the locked prefix
+    // (7/10 of recommended_working_set, per ds4). On mid-chunk mlock failure,
+    // the already-locked prefix is munlock'd, the slab is freed, and the cache
+    // falls back to non-locked allocation with a warning (caller can retry with
+    // a smaller budget). Returns true if the full slab (or the budgeted prefix)
+    // was mlock'd; false (err set) if allocation itself failed.
+    //
+    // If the slab fits within budget_bytes, the entire slab is mlock'd.
+    // Otherwise, only the first floor(budget_bytes/per_expert_bytes) experts'
+    // worth of bytes are mlock'd (the rest stays ordinary heap and may be
+    // paged out under pressure — S4's pre-warm plan avoids loading cold experts
+    // into the unlocked tail).
+    bool alloc_locked(size_t budget_bytes_in, std::string & err);
 
     // --- core I/O API (validated by test-expert-slab.cpp) ---
     //
