@@ -282,7 +282,15 @@ bool llama_expert_slab_hook_install(common_params & params,
     fprintf(stderr, "%s: expert-slab hook installed — ", __func__);
     st->slab->print_summary("hook");
 
-    // ---- 3. ingest hotlist + pre-warm ----
+    // ---- 3. ingest hotlist + (background-threaded) pre-warm ----
+    // Story S4 background-thread cut: the pre-warm loop runs on
+    // state->prewarm_thread so install does not block model load / first
+    // decode. The slab's reserve/publish protocol (prewarm_reserve -> pread ->
+    // prewarm_publish) publishes each (layer,expert)->slot map entry with
+    // slot_ready=false first, then marks ready; a concurrent decode-time
+    // lookup() that hits an in-flight slot blocks on slab_cv (diagnosed by
+    // prewarm_blocks) instead of missing. pread happens outside the lock
+    // (disjoint slots). finalize() joins the thread before writeback/summary.
     std::vector<llama_expert_slab_hotlist_entry> hl;
     if (!params.streaming_hotlist.empty()) {
         hl = llama_expert_slab_hotlist_load(params.streaming_hotlist, err);
@@ -291,51 +299,68 @@ bool llama_expert_slab_hook_install(common_params & params,
             err.clear();
         }
     }
-    // Pre-warm (synchronous in this S4 cut; the background-thread refinement is
-    // noted in the plan). Pre-warm the top min(N_hot, cache_experts) entries by
-    // preading their gate/up/down bytes from the GGUF shard into slab slots.
-    size_t n_warm = std::min(hl.size(), st->slab->cache_experts);
-    uint32_t n_skipped_boosted = 0;
-    for (size_t i = 0; i < n_warm; ++i) {
-        const auto & e = hl[i];
-        auto it = st->layers.find(e.layer);
-        if (it == st->layers.end()) continue;
-        const auto & lay = it->second;
-        // Story S7: skip boosted (spliced, non-uniform) layers — their bytes
-        // are a different qtype and can't be served by this single-class slab.
-        // They fall back to direct mmap reads (correctness preserved; the slab
-        // simply doesn't cache them). This also avoids wasting slab slots.
-        if (!lay.uniform) { n_skipped_boosted++; continue; }
-        // Find a free slot (or recycle slot 0).
-        size_t slot = SIZE_MAX;
-        for (size_t s = 0; s < st->slab->slots.size(); ++s) {
-            if (!st->slab->slots[s].valid) { slot = s; break; }
-        }
-        if (slot == SIZE_MAX) slot = 0;
-        uint8_t * dst = st->slab->slot_ptr(slot);
-        if (!dst) continue;
-        bool ok_g = pread_bytes(lay.gate_path, lay.gate_off + e.expert_id*lay.gate_stride,
-                                lay.gate_stride, dst + 0);
-        bool ok_u = pread_bytes(lay.up_path,   lay.up_off   + e.expert_id*lay.up_stride,
-                                lay.up_stride,   dst + st->slab->gate_expert_bytes);
-        bool ok_d = pread_bytes(lay.down_path, lay.down_off + e.expert_id*lay.down_stride,
-                                lay.down_stride, dst + st->slab->gate_expert_bytes + st->slab->up_expert_bytes);
-        if (ok_g && ok_u && ok_d) {
-            st->slab->slots[slot].layer     = e.layer;
-            st->slab->slots[slot].expert_id = e.expert_id;
-            st->slab->slots[slot].valid     = true;
-            st->slab->slot_ready[slot]      = true;
-            st->slab->map[((uint64_t)e.layer << 32) | e.expert_id] = slot;
-            st->slab->hotlist_entries_loaded++;
-            st->slab->n_prewarm_loaded++;
-        }
+    state_out = std::move(st);   // state now lives at its final location
+    auto * state_ptr = state_out.get();
+
+    if (!hl.empty()) {
+        // Capture by value: the slab pointer, the layers map (shared_ptr to avoid copy),
+        // the hotlist (moved in), and the entry count to pre-warm.
+        size_t n_warm = std::min(hl.size(), state_ptr->slab->cache_experts);
+        std::vector<llama_expert_slab_hotlist_entry> hl_mv = std::move(hl);
+        // layers map is read-only during the worker's lifetime (finalize joins
+        // before any teardown), so a raw pointer to it is safe.
+        auto * layers_ptr = &state_ptr->layers;
+        auto * slab_p    = state_ptr->slab.get();
+
+        state_ptr->prewarm_thread = std::thread([state_ptr, slab_p, layers_ptr,
+                                                  hl_mv = std::move(hl_mv), n_warm]() {
+            uint32_t n_skipped_boosted = 0;
+            for (size_t i = 0; i < n_warm; ++i) {
+                const auto & e = hl_mv[i];
+                auto it = layers_ptr->find(e.layer);
+                if (it == layers_ptr->end()) continue;
+                const auto & lay = it->second;
+                // Story S7: skip boosted (spliced, non-uniform) layers — their
+                // bytes are a different qtype and can't be served by this
+                // single-class slab. They fall back to direct mmap reads.
+                if (!lay.uniform) { n_skipped_boosted++; continue; }
+
+                // Reserve: publish the map entry with slot_ready=false so a
+                // concurrent lookup blocks on the cv rather than missing.
+                size_t slot = slab_p->prewarm_reserve(e.layer, e.expert_id);
+                if (slot == SIZE_MAX) continue;
+                uint8_t * dst = slab_p->slot_ptr(slot);
+                if (!dst) {
+                    slab_p->prewarm_publish(slot, false, e.layer, e.expert_id);
+                    continue;
+                }
+                // Load bytes OUTSIDE the lock (disjoint slots).
+                bool ok_g = pread_bytes(lay.gate_path, lay.gate_off + (size_t)e.expert_id*lay.gate_stride,
+                                        lay.gate_stride, dst + 0);
+                bool ok_u = pread_bytes(lay.up_path,   lay.up_off   + (size_t)e.expert_id*lay.up_stride,
+                                        lay.up_stride,   dst + slab_p->gate_expert_bytes);
+                bool ok_d = pread_bytes(lay.down_path, lay.down_off + (size_t)e.expert_id*lay.down_stride,
+                                        lay.down_stride, dst + slab_p->gate_expert_bytes + slab_p->up_expert_bytes);
+                bool ok = ok_g && ok_u && ok_d;
+                slab_p->prewarm_publish(slot, ok, e.layer, e.expert_id);
+                if (ok) {
+                    slab_p->hotlist_entries_loaded++;
+                    slab_p->n_prewarm_loaded++;
+                }
+            }
+            fprintf(stderr, "expert-slab hook: pre-warmed %u of %zu hotlist entries into %zu-slot slab"
+                    " (skipped %u boosted-layer entries, S7 mmap-served)\n",
+                    slab_p->hotlist_entries_loaded, hl_mv.size(), slab_p->cache_experts, n_skipped_boosted);
+            state_ptr->prewarm_done.store(true, std::memory_order_release);
+        });
+        fprintf(stderr, "expert-slab hook: pre-warming %zu hotlist entries in background"
+                " (%zu-slot slab)\n", n_warm, state_ptr->slab->cache_experts);
+    } else {
+        state_ptr->prewarm_done.store(true, std::memory_order_release);
     }
-    fprintf(stderr, "expert-slab hook: pre-warmed %u of %zu hotlist entries into %zu-slot slab"
-            " (skipped %u boosted-layer entries, S7 mmap-served)\n",
-            st->slab->hotlist_entries_loaded, hl.size(), st->slab->cache_experts, n_skipped_boosted);
 
     // ---- 4. install cb_eval ----
-    auto * slab_ptr = st->slab.get();
+    auto * slab_ptr = state_ptr->slab.get();
     params.cb_eval = [](struct ggml_tensor * t, bool ask, void * ud) -> bool {
         if (ask) return true;
         if (!t) return true;
@@ -374,12 +399,20 @@ bool llama_expert_slab_hook_install(common_params & params,
     };
     params.cb_eval_user_data = slab_ptr;
 
-    state_out = std::move(st);
     return true;
 }
 
 void llama_expert_slab_hook_finalize(const std::unique_ptr<llama_expert_slab_hook_state> & state) {
     if (!state || !state->slab) return;
+    // Story S4 background-thread: join the pre-warm worker before writeback /
+    // summary so hotlist_entries_loaded / n_prewarm_loaded / selection_counts
+    // are stable. The worker iterates a bounded hotlist and exits on its own; if
+    // finalize is reached early (e.g. short run), join waits for the remaining
+    // pre-warm preads to finish (bounded by hotlist size). Detach would risk
+    // use-after-free since the worker reads state->slab / state->layers.
+    if (state->prewarm_thread.joinable()) {
+        state->prewarm_thread.join();
+    }
     // Story S5: write the measured hotlist before printing the summary.
     if (state->slab->writeback_enabled && !state->hotlist_out_path.empty()) {
         std::string err;

@@ -23,6 +23,8 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <mutex>
+#include <condition_variable>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -154,6 +156,15 @@ struct llama_expert_slab_cache {
     // on lookup() only if the slot is requested before ready==true (rare).
     std::vector<bool> slot_ready;
 
+    // --- Story S4 background-thread pre-warm: synchronization ---
+    // Guards slots[]/map/slot_ready against the pre-warm worker thread.
+    // lookup() takes the lock to find a slot; if the slot is reserved but
+    // not yet ready (pre-warm in flight), it increments prewarm_blocks and
+    // waits on slab_cv until the worker publishes slot_ready=true.
+    mutable std::mutex          slab_mtx;
+    std::condition_variable     slab_cv;
+    uint64_t                    prewarm_blocks = 0; // lookups that blocked on an in-flight pre-warm slot
+
     // --- Story S5: runtime hotlist writeback ---
     // Per-(layer, expert) selection counts accumulated during inference.
     // O(1) increment per event, no hot-path allocation. Indexed as
@@ -231,7 +242,26 @@ struct llama_expert_slab_cache {
     //
     // Look up (layer, expert_id). Returns the slot index on HIT (and bumps
     // n_hit), or SIZE_MAX on MISS (and bumps n_miss). Does not read or copy.
+    // Story S4 background-thread cut: if the slot is reserved (in the map) but
+    // its pre-warm load hasn't completed (slot_ready==false), this blocks on
+    // slab_cv until ready, bumping prewarm_blocks. Safe to call from the
+    // cb_eval decode thread; the pre-warm worker holds the lock only briefly
+    // between disjoint-slot preads.
     size_t lookup(uint32_t layer, uint32_t expert_id);
+
+    // --- Story S4 background-thread pre-warm: reserve / publish protocol ---
+    // prewarm_reserve() claims a free slot (or recycles slot 0), publishes the
+    // (layer,expert)->slot map entry with slot_ready=false, and returns the
+    // slot index. Caller then preads the expert bytes into slot_ptr(slot)
+    // WITHOUT holding the lock (disjoint slots), then calls prewarm_publish().
+    // Returns SIZE_MAX if the slab is disabled or has no slots.
+    size_t prewarm_reserve(uint32_t layer, uint32_t expert_id);
+    // prewarm_publish() marks the slot ready: on ok=true sets slot_ready=true
+    // and notifies waiters; on ok=false unpublishes (erases the map entry,
+    // frees the slot, still sets slot_ready=true so any waiter unblocks) and
+    // notifies. The (layer, expert_id) args are used only on the failure path
+    // to erase the correct map key.
+    void   prewarm_publish(size_t slot, bool ok, uint32_t layer, uint32_t expert_id);
 
     // On MISS, load expert `expert_id` of layer `layer` into a free slot
     // (eviction is LRU-ish: picks the first free slot, or if none, slot 0 —

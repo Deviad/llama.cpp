@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <mutex>
 #include <tuple>
 #include <vector>
 
@@ -108,13 +109,68 @@ size_t llama_expert_slab_cache::lookup(uint32_t layer, uint32_t expert_id) {
     if (!enabled()) {
         return SIZE_MAX;
     }
+    std::unique_lock<std::mutex> lk(slab_mtx);
     auto it = map.find(make_key(layer, expert_id));
     if (it != map.end()) {
+        size_t slot = it->second;
+        // Story S4 background-thread pre-warm: if the slot is reserved but its
+        // pread hasn't completed (slot_ready==false), block until the worker
+        // publishes it. This is the rare "requested before load completes" path
+        // diagnosed by prewarm_blocks.
+        if (slot < slot_ready.size() && !slot_ready[slot]) {
+            prewarm_blocks++;
+            slab_cv.wait(lk, [&] { return slot >= slot_ready.size() || slot_ready[slot]; });
+        }
         n_hit++;
-        return it->second;
+        return slot;
     }
     n_miss++;
     return SIZE_MAX;
+}
+
+size_t llama_expert_slab_cache::prewarm_reserve(uint32_t layer, uint32_t expert_id) {
+    if (!enabled()) {
+        return SIZE_MAX;
+    }
+    std::lock_guard<std::mutex> lk(slab_mtx);
+    // Find a free slot; if none, recycle slot 0 (S2/S5 will replace with LRU).
+    size_t target = SIZE_MAX;
+    for (size_t i = 0; i < slots.size(); ++i) {
+        if (!slots[i].valid) { target = i; break; }
+    }
+    if (target == SIZE_MAX) {
+        target = 0;
+        if (slots[0].valid) {
+            map.erase(make_key(slots[0].layer, slots[0].expert_id));
+        }
+    }
+    // Reserve: publish the map entry but mark not-ready so concurrent
+    // lookups block on the cv until the pread completes.
+    slots[target].layer     = layer;
+    slots[target].expert_id = expert_id;
+    slots[target].valid     = true;
+    map[make_key(layer, expert_id)] = target;
+    if (target < slot_ready.size()) slot_ready[target] = false;
+    return target;
+}
+
+void llama_expert_slab_cache::prewarm_publish(size_t slot, bool ok,
+                                              uint32_t layer, uint32_t expert_id) {
+    if (!enabled() || slot >= cache_experts) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(slab_mtx);
+    if (ok) {
+        if (slot < slot_ready.size()) slot_ready[slot] = true;
+    } else {
+        // Unpublish: the pread failed, so free the slot and drop the map entry.
+        // Set slot_ready=true so any waiter unblocks (the slot is now empty,
+        // lookups for this (layer,expert) will miss and the slot is reusable).
+        map.erase(make_key(layer, expert_id));
+        slots[slot].valid = false;
+        if (slot < slot_ready.size()) slot_ready[slot] = true;
+    }
+    slab_cv.notify_all();
 }
 
 size_t llama_expert_slab_cache::load_on_miss(uint32_t layer, uint32_t expert_id,
@@ -123,10 +179,17 @@ size_t llama_expert_slab_cache::load_on_miss(uint32_t layer, uint32_t expert_id,
     if (!enabled()) {
         return SIZE_MAX;
     }
+    // Test / synchronous path: guard the whole body under the lock (tests are
+    // single-threaded, so holding the lock across the memcpy is fine). Live
+    // inference does not call load_on_miss (the hook calls note_moe_selection
+    // -> lookup only); this is here for the byte-serving future cut + tests.
+    std::lock_guard<std::mutex> lk(slab_mtx);
     // Already present? short-circuit (counts as a hit, not a miss-load).
-    size_t slot = lookup(layer, expert_id);
-    if (slot != SIZE_MAX) {
-        return slot;
+    {
+        auto it = map.find(make_key(layer, expert_id));
+        if (it != map.end()) {
+            return it->second;
+        }
     }
     // Find a free slot; if none, recycle slot 0 (S2/S5 will replace with LRU).
     size_t target = SIZE_MAX;
@@ -170,6 +233,7 @@ size_t llama_expert_slab_cache::load_on_miss(uint32_t layer, uint32_t expert_id,
     slots[target].expert_id = expert_id;
     slots[target].valid     = true;
     map[make_key(layer, expert_id)] = target;
+    if (target < slot_ready.size()) slot_ready[target] = true; // synchronous load: ready immediately
     return target;
 }
 
@@ -215,10 +279,11 @@ void llama_expert_slab_cache::print_summary(const char * label) const {
         LLAMA_EXPERT_SLAB_MLOCK_CHUNK / (1024*1024));
     fprintf(stderr,
         "expert-slab: hotlist_entries_loaded=%u prewarm_hits=%llu prewarm_misses=%llu "
-        "first_token_hit_rate=%.1f%%\n",
+        "prewarm_blocks=%llu first_token_hit_rate=%.1f%%\n",
         hotlist_entries_loaded,
         (unsigned long long) prewarm_hits,
         (unsigned long long) prewarm_misses,
+        (unsigned long long) prewarm_blocks,
         (prewarm_hits + prewarm_misses) == 0 ? 0.0 :
             100.0 * (double) prewarm_hits / (double)(prewarm_hits + prewarm_misses));
 }

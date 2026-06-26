@@ -79,6 +79,16 @@ struct llama_expert_slab_hook_state {
     std::string hotlist_out_path;
     // Story S7: emit the per-layer uniform/boosted report at finalize.
     bool streaming_report = false;
+
+    // Story S4 background-thread: safety-net destructor. finalize() joins the
+    // thread; if it is NOT called (abnormal exit / unique_ptr destroyed without
+    // finalize), std::thread's destructor would call std::terminate while still
+    // joinable. Join here so teardown is always clean.
+    ~llama_expert_slab_hook_state() {
+        if (prewarm_thread.joinable()) {
+            prewarm_thread.join();
+        }
+    }
 };
 
 // Opaque hook state (defined in the .cpp).

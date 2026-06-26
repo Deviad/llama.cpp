@@ -20,6 +20,9 @@
 #include <string>
 #include <fstream>
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
 
 static int failures = 0;
 
@@ -493,6 +496,59 @@ int main() {
         size_t uni_bytes    = uni.gate_stride + uni.up_stride + uni.down_stride;
         size_t boosted_bytes = boosted.gate_stride + boosted.up_stride + boosted.down_stride;
         CHECK(uni_bytes != boosted_bytes, "S7: uniform vs boosted per_expert_bytes differ (can't share slab)");
+    }
+
+    // ---- Story S4 background-thread: pre-warm reserve/publish + lookup blocking ----
+    {
+        std::string err;
+        llama_expert_slab_cache slab;
+        slab.per_expert_bytes = 192; slab.gate_expert_bytes = 64;
+        slab.up_expert_bytes = 64; slab.down_expert_bytes = 64;
+        slab.cache_experts   = 2;
+        CHECK(slab.alloc(err), "S4bg: alloc 2-slot slab");
+
+        // Worker reserves a slot (publishes map entry, slot_ready=false),
+        // sleeps to simulate a slow pread, then publishes ready. The main
+        // thread waits for the reservation, then calls lookup() which must
+        // block on slab_cv until the worker publishes (prewarm_blocks++).
+        std::atomic<bool> reserved{false};
+        std::atomic<bool> published{false};
+        std::atomic<size_t> worker_slot{SIZE_MAX};
+        std::thread worker([&]() {
+            size_t slot = slab.prewarm_reserve(0, 5);
+            worker_slot.store(slot);
+            reserved.store(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            uint8_t * dst = slab.slot_ptr(slot);
+            if (dst) dst[0] = 0xAB;
+            slab.prewarm_publish(slot, slot != SIZE_MAX, 0, 5);
+            published.store(true);
+        });
+        // wait until the worker has reserved (slot now in map, not ready)
+        while (!reserved.load()) std::this_thread::yield();
+        // give the worker time to be mid-sleep (slot still not ready)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        uint64_t blocks_before = slab.prewarm_blocks;
+        size_t s = slab.lookup(0, 5);
+        CHECK(s != SIZE_MAX, "S4bg: lookup on in-flight pre-warm returns the slot once ready");
+        CHECK(slab.prewarm_blocks > blocks_before,
+              "S4bg: lookup blocked on an in-flight pre-warm slot (prewarm_blocks incremented)");
+        CHECK(published.load() == true, "S4bg: worker published before lookup returned");
+        worker.join();
+
+        // A second lookup on the now-ready slot hits without blocking.
+        uint64_t blocks_after = slab.prewarm_blocks;
+        CHECK(slab.lookup(0, 5) != SIZE_MAX, "S4bg: second lookup hits the ready slot");
+        CHECK(slab.prewarm_blocks == blocks_after, "S4bg: second lookup does not block (slot already ready)");
+
+        // Pread failure path: reserve then publish(ok=false) must unpublish
+        // so lookups miss (not block forever) and the slot is reusable.
+        size_t slot2 = slab.prewarm_reserve(1, 7);
+        CHECK(slot2 != SIZE_MAX, "S4bg: prewarm_reserve (1,7) returns a slot");
+        slab.prewarm_publish(slot2, false, 1, 7);
+        CHECK(slab.lookup(1, 7) == SIZE_MAX,
+              "S4bg: failed pre-warm unpublishes (lookup misses, slot freed)");
     }
 
     if (failures == 0) {
