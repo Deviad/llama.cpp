@@ -169,6 +169,7 @@ enum class Backpressure { Block, Drop, Sample };
 struct TraceConfig {
     std::string trace_out;
     std::string trace_prompts;              // path to JSONL prompts file (batched mode)
+    std::string imatrix_out;               // Story S13: per-expert imatrix sidecar path ("" = off)
     std::string task_label     = "adhoc";
     std::string language       = "en";
     std::string script         = "Latin";
@@ -494,6 +495,30 @@ struct TraceState {
     // current_l_out).
     std::unordered_map<int, std::vector<float>> prev_l_out_per_token;
 
+    // Story S13: per-expert imatrix collector.
+    // When --imatrix-out is set, the callback also caches the FFN input
+    // (ffn_norm-N, the post-RMSNorm tensor feeding the MoE gate) per layer
+    // per token, and when ffn_moe_topk-N fires it accumulates, per selected
+    // expert, the per-column-group sum of squares of that input vector into
+    // a dense (n_layers × n_experts × n_colgroups) table. At shutdown the
+    // table is written as a sidecar binary file consumed by S14's
+    // llama-quantize --imatrix-expert. Zero overhead when imatrix_out is
+    // empty (the ffn_norm branch + the accumulator writes are both gated).
+    bool        imatrix_enabled    = false;
+    std::string imatrix_out;
+    int         imatrix_n_layers   = 0;
+    int         imatrix_n_experts  = 0;
+    int         imatrix_n_embd     = 0;
+    int         imatrix_group_size = 256;   // llama.cpp imatrix column-group granularity
+    int         imatrix_n_colgroups = 0;    // = ceil(n_embd / group_size)
+    std::vector<float> imatrix_table;        // [layer][expert][colgroup]
+    // per-layer FFN input cache: filled when ffn_norm-N fires, consumed when
+    // ffn_moe_topk-N fires for the same layer. Stores n_tokens * n_embd F32.
+    // Reused across layers (overwritten when the next layer's ffn_norm fires).
+    std::unordered_map<int, std::vector<float>> cached_ffn_norm;
+    std::unordered_map<int, int>               cached_ffn_norm_n_tokens;
+    uint64_t imatrix_events = 0;   // count of (token, expert) accumulations
+
     // (readback now uses a per-call fresh buffer; no shared scratch field)
 };
 
@@ -521,6 +546,52 @@ bool is_weights_tensor(const char * name) {
     // accept "ffn_moe_weights" or "ffn_moe_weights-N"
     if (s.size() == std::string("ffn_moe_weights").size()) return true;
     return s[std::string("ffn_moe_weights").size()] == '-';
+}
+
+// Story S13: detect the FFN input tensor (post-RMSNorm output feeding the MoE
+// gate). The GLM-DSA graph names this node "ffn_norm-N" via cb(cur, "ffn_norm", il)
+// (src/models/glm-dsa.cpp). This is the input to ffn_gate_exps.weight and
+// ffn_up_exps.weight — the routed-expert weights S14 quantizes with the
+// per-expert imatrix. (The input to ffn_down_exps is the gate-up product,
+// expert-specific; for the smoke AC we use ffn_norm as the shared expert
+// input proxy — variance comes from which tokens route to which expert, which
+// matches ds4's per-expert Σ input² semantics.)
+bool is_ffn_norm_tensor(const char * name) {
+    std::string s(name);
+    if (s.rfind("ffn_norm", 0) != 0) return false;
+    if (s.size() == std::string("ffn_norm").size()) return true;     // no layer suffix
+    return s[std::string("ffn_norm").size()] == '-';                  // "ffn_norm-N"
+}
+
+// Story S13: write the per-expert imatrix sidecar (binary, dense).
+// Layout (little-endian):
+//   magic       : 8 bytes  = "GLMIMAT\x01"
+//   n_layers    : int32
+//   n_experts   : int32
+//   n_embd      : int32
+//   n_colgroups: int32
+//   group_size  : int32
+//   reserved    : int32 (0)
+//   data        : n_layers * n_experts * n_colgroups * float32 (row-major)
+//                 index = ((layer * n_experts) + expert) * n_colgroups + colgroup
+// Non-written (zero) entries mean "no calibration traffic hit this expert" —
+// S14 falls back to the per-tensor imatrix or the synthetic heuristic for those.
+bool imatrix_write_sidecar(const TraceState & st, const std::string & path) {
+    FILE * f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const char magic[8] = {'G','L','M','I','M','A','T','\x01'};
+    std::fwrite(magic, 1, 8, f);
+    int32_t hdr[6] = {
+        st.imatrix_n_layers, st.imatrix_n_experts, st.imatrix_n_embd,
+        st.imatrix_n_colgroups, st.imatrix_group_size, 0
+    };
+    std::fwrite(hdr, sizeof(int32_t), 6, f);
+    if (!st.imatrix_table.empty()) {
+        std::fwrite(st.imatrix_table.data(), sizeof(float),
+                    st.imatrix_table.size(), f);
+    }
+    std::fclose(f);
+    return true;
 }
 
 // Story 6 AC: detect named activation tensors the user opted into via
@@ -596,6 +667,29 @@ bool trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * st = static_cast<TraceState *>(user_data);
     const char * name = t->name;
     if (!name || !name[0]) return true;
+
+    // Story S13: cache the FFN input (post-RMSNorm tensor feeding the MoE
+    // gate) so that the ffn_moe_topk callback can accumulate per-expert Σ x²
+    // into the imatrix table. Independent of --trace-activations so the
+    // collector doesn't also emit activation_summary records. Zero overhead
+    // when imatrix_enabled is false (the predicate isn't even evaluated).
+    if (st->imatrix_enabled && is_ffn_norm_tensor(name) && t->type == GGML_TYPE_F32) {
+        int layer = extract_layer(name);
+        if (layer >= 0 && layer < st->imatrix_n_layers) {
+            int n_tokens = (int) t->ne[1];
+            size_t want = (size_t) n_tokens * (size_t) st->imatrix_n_embd;
+            std::vector<float> & buf = st->cached_ffn_norm[layer];
+            if ((int) t->ne[0] == st->imatrix_n_embd) {
+                if (buf.size() < want) buf.resize(want);
+                ggml_backend_tensor_get(t, buf.data(), 0,
+                                        want * sizeof(float));
+                st->cached_ffn_norm_n_tokens[layer] = n_tokens;
+            }
+        }
+        // Don't fall through to the activation path or MoE path — ffn_norm is
+        // neither a routing tensor nor an activation we want to serialize.
+        return true;
+    }
 
     // Story 6 AC: activation summary path. If the user opted in via
     // --trace-activations and the current tensor is one of the requested
@@ -807,6 +901,40 @@ bool trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
         }
         const int32_t * tk = topk.data() + (size_t) tok * (size_t) n_used;
         emit_one(*st, layer, n_used, tok, tk, w.data());
+
+        // Story S13: per-expert imatrix accumulation. For each selected
+        // expert, accumulate the per-column-group sum of squares of the FFN
+        // input vector (cached when ffn_norm-N fired earlier this batch) into
+        // the (layer, expert, colgroup) table. O(n_used * n_embd) per token,
+        // no allocation in the hot path. Gated by imatrix_enabled — zero
+        // overhead when off.
+        if (st->imatrix_enabled) {
+            auto it = st->cached_ffn_norm.find(layer);
+            if (it != st->cached_ffn_norm.end() && !st->imatrix_table.empty()) {
+                const float * x = it->second.data() + (size_t) tok * (size_t) st->imatrix_n_embd;
+                const int gs   = st->imatrix_group_size;
+                const int ncg = st->imatrix_n_colgroups;
+                const int ne  = st->imatrix_n_experts;
+                for (int k = 0; k < n_used; ++k) {
+                    int e = tk[k];
+                    if (e < 0 || e >= ne) continue;
+                    float * row = st->imatrix_table.data()
+                        + ((size_t) layer * (size_t) ne + (size_t) e) * (size_t) ncg;
+                    for (int g = 0; g < ncg; ++g) {
+                        int c0 = g * gs;
+                        int c1 = c0 + gs;
+                        if (c1 > st->imatrix_n_embd) c1 = st->imatrix_n_embd;
+                        double s = 0.0;
+                        for (int c = c0; c < c1; ++c) {
+                            double v = (double) x[c];
+                            s += v * v;
+                        }
+                        row[g] += (float) s;
+                    }
+                    st->imatrix_events++;
+                }
+            }
+        }
     }
     return true;
 }
@@ -828,6 +956,7 @@ TraceConfig config_from_trace_flags(
             if (i + 1 < trace_args.size()) { dst = trace_args[++i]; }
         };
         if (a == "--trace-out")              take_next(cfg.trace_out);
+        else if (a == "--imatrix-out")          take_next(cfg.imatrix_out);
         else if (a == "--trace-prompts")         take_next(cfg.trace_prompts);
         else if (a == "--trace-task-label")  take_next(cfg.task_label);
         else if (a == "--trace-language")    take_next(cfg.language);
@@ -1395,6 +1524,52 @@ int main(int argc, char ** argv) {
         LOG_INF("%s: n_expert_total = %d (from GGUF KV)", __func__, st.n_expert_total);
     }
 
+    // Story S13: initialize the per-expert imatrix collector when --imatrix-out
+    // is set. Sizes the (n_layers × n_experts × n_colgroups) accumulation table
+    // from GGUF KVs (block_count, expert_count, embedding_length). The table
+    // is dense and zero-initialized; entries remain zero for experts never
+    // selected during calibration (S14 falls back for those). Zero overhead
+    // path when imatrix_out is empty.
+    if (!cfg.imatrix_out.empty() && st.n_expert_total > 0) {
+        // block_count + embedding_length via the model's KV metadata.
+        auto read_kv_int = [&](const char * key, int32_t & out) -> bool {
+            char buf[32] = {0};
+            int32_t r = llama_model_meta_val_str(model, key, buf, sizeof(buf));
+            if (r <= 0) return false;
+            try { out = std::stoi(std::string(buf, r)); return true; }
+            catch (...) { return false; }
+        };
+        int32_t n_layers = 0, n_embd = 0;
+        // Try glm-dsa.* first; fall back to the generic llama.* prefix.
+        if (!read_kv_int("glm-dsa.block_count",       n_layers) &&
+            !read_kv_int("llama.block_count",         n_layers)) n_layers = 0;
+        if (!read_kv_int("glm-dsa.embedding_length",  n_embd) &&
+            !read_kv_int("llama.embedding_length",    n_embd))  n_embd = 0;
+        if (n_layers > 0 && n_embd > 0) {
+            st.imatrix_enabled    = true;
+            st.imatrix_out        = cfg.imatrix_out;
+            st.imatrix_n_layers   = n_layers;
+            st.imatrix_n_experts  = st.n_expert_total;
+            st.imatrix_n_embd     = n_embd;
+            st.imatrix_group_size = 256;
+            st.imatrix_n_colgroups = (n_embd + st.imatrix_group_size - 1)
+                                     / st.imatrix_group_size;
+            st.imatrix_table.assign(
+                (size_t) n_layers * (size_t) st.n_expert_total
+                * (size_t) st.imatrix_n_colgroups, 0.0f);
+            LOG_INF("%s: imatrix collector armed (n_layers=%d n_experts=%d "
+                    "n_embd=%d n_colgroups=%d table=%.1f MB) → %s",
+                    __func__, n_layers, st.n_expert_total, n_embd,
+                    st.imatrix_n_colgroups,
+                    st.imatrix_table.size() * sizeof(float) / (1024.0 * 1024.0),
+                    cfg.imatrix_out.c_str());
+        } else {
+            LOG_WRN("%s: --imatrix-out set but couldn't read block_count / "
+                    "embedding_length from model KVs; imatrix disabled.",
+                    __func__);
+        }
+    }
+
     // ---- sampler for generation ----
     struct llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(params.sampling.temp));
@@ -1486,6 +1661,18 @@ int main(int argc, char ** argv) {
             (unsigned long long) total_dropped,
             (unsigned long long) total_sampled,
             wall_total);
+    }
+
+    // Story S13: flush the per-expert imatrix sidecar at shutdown.
+    if (st.imatrix_enabled) {
+        if (imatrix_write_sidecar(st, st.imatrix_out)) {
+            LOG_INF("%s: imatrix sidecar written to %s (%llu (token,expert) events)\n",
+                    __func__, st.imatrix_out.c_str(),
+                    (unsigned long long) st.imatrix_events);
+        } else {
+            LOG_ERR("%s: failed to write imatrix sidecar to %s\n",
+                    __func__, st.imatrix_out.c_str());
+        }
     }
 
     llama_backend_free();
