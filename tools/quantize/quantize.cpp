@@ -262,15 +262,28 @@ static int load_imatrix(const std::string & imatrix_file, std::vector<std::strin
 
 // Story S14: load the per-expert imatrix sidecar produced by
 // `llama-trace-moe --imatrix-out` (Story S13) and inject per-tensor entries
-// for GLM-5.2 routed-experts tensors (blk.N.ffn_{gate,up,down}_exps.weight) so
-// the existing per-expert slicing loop in llama-quant.cpp picks them up.
+// for GLM-5.2 routed-experts tensors so the existing per-expert slicing loop
+// in llama-quant.cpp picks them up.
+//
+// IMPORTANT (size-correctness fix): the S13 collector captures the post-RMSNorm
+// `ffn_norm-N` tensor — the shared input that feeds ffn_gate_exps AND ffn_up_exps
+// (both have ne[0]=n_embd=6144). It is NOT the input to ffn_down_exps (whose
+// input is the intermediate-dim SiLU(gate)*up product, ne[0]=2048). So the
+// per-expert sidecar is only semantically valid for {gate,up}; ffn_down_exps is
+// left to the existing per-tensor --imatrix path (its input dimension differs).
+//
+// Size contract: the existing lookup in llama-quant.cpp checks
+//   it->second.size() == tensor->ne[0] * tensor->ne[2]
+// For ffn_gate_exps / ffn_up_exps that's n_embd × n_experts = 6144×256 =
+// 1,572,864 — exactly what emit_tensor produces. (ffn_down_exps would be
+// 2048×256 = 524,288, which the sidecar's 6144-dim data can't satisfy; we
+// correctly SKIP it rather than inject a wrong-sized or wrong-semantic vector.)
 //
 // The sidecar is a dense (n_layers x n_experts x n_colgroups) table where each
 // value is the per-column-group (group_size=256) sum of input^2 for (layer, expert).
 // For each affected tensor name we expand to a flat n_embd x n_experts float
 // vector (broadcast each colgroup value across its 256 columns) and inject it
-// into imatrix_data under that tensor name. The existing lookup checks
-// size == tensor->ne[0]*tensor->ne[2] (n_embd x n_experts) — satisfied.
+// into imatrix_data under that tensor name.
 //
 // Experts with no calibration traffic (all-zero colgroups) fall back to the
 // per-layer mean of the calibrated experts (avoids div-by-zero in IQ2_S and
@@ -363,7 +376,11 @@ static int load_imatrix_expert(const std::string & sidecar_path,
 
     int injected = 0;
     int total_calibrated = 0;
-    const char * stems[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+    // Only gate + up — the S13 collector captures ffn_norm which feeds these
+    // (ne[0]=n_embd=6144). ffn_down_exps has ne[0]=intermediate=2048 and a
+    // different input (SiLU(gate)*up), which the sidecar doesn't measure; it
+    // falls through to the existing per-tensor --imatrix path.
+    const char * stems[2] = {"ffn_gate_exps", "ffn_up_exps"};
     for (int layer = 0; layer < n_layers; ++layer) {
         // Skip layers with literally zero calibration data entirely
         // (e.g. blk.78 MTP — the S13 collector doesn't see MTP dispatch).
@@ -375,7 +392,7 @@ static int load_imatrix_expert(const std::string & sidecar_path,
             for (int c = 0; c < n_colgroups; ++c) layer_total += row[c];
         }
         if (layer_total <= 0.0) continue;
-        for (int s = 0; s < 3; ++s) {
+        for (int s = 0; s < 2; ++s) {
             char name[128];
             std::snprintf(name, sizeof(name), "blk.%d.%s.weight", layer, stems[s]);
             total_calibrated += emit_tensor(name, layer);
