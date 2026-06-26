@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <set>
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-dsa.h"
 
@@ -199,6 +201,31 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // ── AC3: F/S (Full/Shared) IndexShare gating ─────────────────────────────
+    // Upstream GLM-5.2 carries `indexer_types[]` = 21 "full" / 57 "shared"
+    // layers (per HF config.json). A "full" layer owns indexer tensors and
+    // computes its own top_k selection; a "shared" layer has NO indexer
+    // tensors of its own and must REUSE the most recent full layer's top_k.
+    // The known-good kitchen GGUF does NOT carry `indexer_types[]` metadata
+    // (it materialized indexer tensors on all 79 blocks), so the C++ graph
+    // below previously ran the lightning indexer on EVERY layer — including
+    // the 57 shared layers — producing divergent top_k selections above the
+    // `index_topk = 2048` boundary and garbage output for seq_len > 2048
+    // (S18a root cause). This gate restores the intended F/S reuse: shared
+    // layers skip the indexer block and carry forward the prior full layer's
+    // top_k tensor. TODO: read `indexer_types[]` from GGUF metadata once
+    // gguf-py writes it; the hardcoded set below matches upstream GLM-5.2's
+    // 21 full positions exactly (verified 2026-06-26 against HF config.json).
+    const std::set<int> glm_dsa_full_indexer_layers = {
+        0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74,
+    };
+    auto is_full_indexer_layer = [&](int il) {
+        return glm_dsa_full_indexer_layers.count(il) > 0;
+    };
+    // Carried across loop iterations: the most recent full layer's top_k.
+    ggml_tensor * prev_full_topk = nullptr;
+    // ── AC3: end F/S bookkeeping setup ──────────────────────────────────────
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -216,8 +243,9 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
 
             ggml_tensor * top_k = nullptr;
 
-            // lightning indexer
-            {
+            // AC3: lightning indexer runs ONLY on "full" indexer layers.
+            // "shared" layers skip this block and reuse prev_full_topk.
+            if (is_full_indexer_layer(il)) {
                 ggml_tensor * indexer_q = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_q_b, qr);
                 cb(indexer_q, "indexer_q", il);
 
@@ -347,6 +375,21 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
                 uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
                 top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
                 cb(top_k, "top_k", il);
+
+                // AC3: this full layer's top_k becomes the reuse source for
+                // subsequent shared layers until the next full layer.
+                prev_full_topk = top_k;
+            } else {
+                // AC3: shared layer — reuse the most recent full layer's
+                // top_k selection (the intended F/S IndexShare behavior).
+                // The shared layer did NOT run the indexer block, so its
+                // top_k comes from the carry. If no full layer preceded it
+                // (shouldn't happen — layer 0 is full), fall back to nullptr
+                // (= attend to all, the no-filter path).
+                top_k = prev_full_topk;
+                if (top_k) {
+                    cb(top_k, "top_k_reused", il);
+                }
             }
 
             ggml_tensor * q = ggml_mul_mat(ctx0, model.layers[il].wq_b, qr);
