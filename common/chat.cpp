@@ -2679,8 +2679,22 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             return msg;
         }
         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
-        LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
-        throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
+        LOG_DBG("%s: full %s output triggering fallback:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
+        // Story S15: return a content-only fallback msg instead of throwing.
+        // The autoparser-generated PEG grammar for the model's chat template
+        // can fail to match degenerate model output (long-ctx drift, greedy
+        // decoding, low-bit quantization). Previously this threw an uncaught
+        // std::runtime_error that propagated to libc++abi::terminate -> SIGABRT,
+        // aborting llama-cli -cnv mid-stream. Returning the raw text as plain
+        // assistant content degrades gracefully: generation stays bounded by
+        // n_predict, antiprompt/EOS detection runs as usual, and the caller
+        // still sees the full generated text. Mirrors the partial-results
+        // graceful path above. The underlying degeneration is a model/template
+        // quality issue, not a parser issue — but the parser must not abort.
+        common_chat_msg fallback;
+        fallback.role    = "assistant";
+        fallback.content = effective_input;
+        return fallback;
     }
 
     common_chat_msg msg;
