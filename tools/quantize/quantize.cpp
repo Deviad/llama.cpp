@@ -119,7 +119,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 
 [[noreturn]]
 static void usage(const char * executable) {
-    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
+    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--imatrix-expert] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file]\n");
     printf("       [--prune-layers] [--keep-split] [--override-kv] [--dry-run]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
@@ -134,6 +134,10 @@ static void usage(const char * executable) {
     printf("                                      disable k-quant mixtures and quantize all tensors to the same type\n");
     printf("  --imatrix file_name\n");
     printf("                                      use data in file_name as importance matrix for quant optimizations\n");
+    printf("  --imatrix-expert file_name\n");
+    printf("                                      use the per-expert imatrix sidecar from `llama-trace-moe --imatrix-out`\n");
+    printf("                                      (per-expert slicing for blk.N.ffn_{gate,up,down}_exps.weight;\n");
+    printf("                                      composes with --imatrix for non-routed tensors)\n");
     printf("  --include-weights tensor_name\n");
     printf("                                      use importance matrix for this/these tensor(s)\n");
     printf("  --exclude-weights tensor_name\n");
@@ -254,6 +258,134 @@ static int load_imatrix(const std::string & imatrix_file, std::vector<std::strin
     printf("%s: loaded %d importance matrix entries from %s computed on %d chunks\n", __func__, int(imatrix_data.size()), imatrix_file.c_str(), loaded.chunk_count);
 
     return loaded.chunk_count;
+}
+
+// Story S14: load the per-expert imatrix sidecar produced by
+// `llama-trace-moe --imatrix-out` (Story S13) and inject per-tensor entries
+// for GLM-5.2 routed-experts tensors (blk.N.ffn_{gate,up,down}_exps.weight) so
+// the existing per-expert slicing loop in llama-quant.cpp picks them up.
+//
+// The sidecar is a dense (n_layers x n_experts x n_colgroups) table where each
+// value is the per-column-group (group_size=256) sum of input^2 for (layer, expert).
+// For each affected tensor name we expand to a flat n_embd x n_experts float
+// vector (broadcast each colgroup value across its 256 columns) and inject it
+// into imatrix_data under that tensor name. The existing lookup checks
+// size == tensor->ne[0]*tensor->ne[2] (n_embd x n_experts) — satisfied.
+//
+// Experts with no calibration traffic (all-zero colgroups) fall back to the
+// per-layer mean of the calibrated experts (avoids div-by-zero in IQ2_S and
+// is a sensible prior — ds4's fallback is the synthetic weight-energy heuristic
+// from the weight data itself, which we can't compute here without reading the
+// tensor; the per-layer mean is a documented pragmatic fallback for S14).
+//
+// Returns the number of tensor-name entries injected (0 on failure).
+static int load_imatrix_expert(const std::string & sidecar_path,
+        std::unordered_map<std::string, std::vector<float>> & imatrix_data) {
+    FILE * f = std::fopen(sidecar_path.c_str(), "rb");
+    if (!f) {
+        fprintf(stderr, "%s: failed to open per-expert imatrix sidecar '%s'\n",
+                __func__, sidecar_path.c_str());
+        return 0;
+    }
+    char magic[8];
+    static const char expected[8] = {'G','L','M','I','M','A','T','\x01'};
+    if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, expected, 8) != 0) {
+        fprintf(stderr, "%s: bad magic in %s (not a GLMIMAT sidecar)\n",
+                __func__, sidecar_path.c_str());
+        std::fclose(f); return 0;
+    }
+    int32_t hdr[6] = {0,0,0,0,0,0};
+    if (std::fread(hdr, sizeof(int32_t), 6, f) != 6) {
+        fprintf(stderr, "%s: truncated header in %s\n", __func__, sidecar_path.c_str());
+        std::fclose(f); return 0;
+    }
+    int n_layers    = hdr[0];
+    int n_experts   = hdr[1];
+    int n_embd      = hdr[2];
+    int n_colgroups = hdr[3];
+    int group_size  = hdr[4];
+    if (n_layers <= 0 || n_experts <= 0 || n_embd <= 0 || n_colgroups <= 0 || group_size <= 0) {
+        fprintf(stderr, "%s: invalid sidecar dims in %s\n", __func__, sidecar_path.c_str());
+        std::fclose(f); return 0;
+    }
+    size_t total = (size_t) n_layers * (size_t) n_experts * (size_t) n_colgroups;
+    std::vector<float> data(total);
+    if (std::fread(data.data(), sizeof(float), total, f) != total) {
+        fprintf(stderr, "%s: truncated data in %s (want %zu floats)\n",
+                __func__, sidecar_path.c_str(), total);
+        std::fclose(f); return 0;
+    }
+    std::fclose(f);
+
+    printf("%s: loaded per-expert imatrix sidecar from %s (n_layers=%d "
+           "n_experts=%d n_embd=%d n_colgroups=%d)\n", __func__, sidecar_path.c_str(),
+           n_layers, n_experts, n_embd, n_colgroups);
+
+    // per-layer per-colgroup mean across calibrated experts (fallback prior).
+    auto per_layer_mean = [&](int layer, std::vector<float> & out) {
+        out.assign(n_colgroups, 0.0f);
+        int calibrated = 0;
+        for (int e = 0; e < n_experts; ++e) {
+            const float * row = data.data() + ((size_t) layer * n_experts + e) * n_colgroups;
+            double s = 0.0;
+            for (int c = 0; c < n_colgroups; ++c) s += row[c];
+            if (s > 0.0) {
+                for (int c = 0; c < n_colgroups; ++c) out[c] += row[c];
+                calibrated++;
+            }
+        }
+        if (calibrated > 0) for (int c = 0; c < n_colgroups; ++c) out[c] /= calibrated;
+        else std::fill(out.begin(), out.end(), 1.0f);  // no calibration at all → uniform
+    };
+
+    // Expand (layer, expert, colgroups) → flat n_embd x n_experts per tensor.
+    // imatrix_layout: imatrix[expert * n_embd + col] (matches llama-quant.cpp's
+    // `imatrix + i03 * n_per_row` slicing, i03 = expert index).
+    auto emit_tensor = [&](const char * tensor_name, int layer) {
+        std::vector<float> flat((size_t) n_embd * (size_t) n_experts, 0.0f);
+        std::vector<float> fallback;
+        per_layer_mean(layer, fallback);
+        int calibrated = 0;
+        for (int e = 0; e < n_experts; ++e) {
+            const float * row = data.data() + ((size_t) layer * n_experts + e) * n_colgroups;
+            double s = 0.0;
+            for (int c = 0; c < n_colgroups; ++c) s += row[c];
+            const float * src = (s > 0.0) ? row : fallback.data();
+            if (s > 0.0) calibrated++;
+            float * dst = flat.data() + (size_t) e * n_embd;
+            for (int c = 0; c < n_embd; ++c) {
+                dst[c] = src[c / group_size];
+            }
+        }
+        imatrix_data[tensor_name] = std::move(flat);
+        return calibrated;
+    };
+
+    int injected = 0;
+    int total_calibrated = 0;
+    const char * stems[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+    for (int layer = 0; layer < n_layers; ++layer) {
+        // Skip layers with literally zero calibration data entirely
+        // (e.g. blk.78 MTP — the S13 collector doesn't see MTP dispatch).
+        // Those fall through to the existing per-tensor --imatrix path or
+        // the synthetic weight-energy heuristic as the AC requires.
+        double layer_total = 0.0;
+        for (int e = 0; e < n_experts; ++e) {
+            const float * row = data.data() + ((size_t) layer * n_experts + e) * n_colgroups;
+            for (int c = 0; c < n_colgroups; ++c) layer_total += row[c];
+        }
+        if (layer_total <= 0.0) continue;
+        for (int s = 0; s < 3; ++s) {
+            char name[128];
+            std::snprintf(name, sizeof(name), "blk.%d.%s.weight", layer, stems[s]);
+            total_calibrated += emit_tensor(name, layer);
+            injected++;
+        }
+    }
+    printf("%s: injected per-expert imatrix for %d expert tensors "
+           "(%d calibrated (layer,expert) rows total)\n",
+           __func__, injected, total_calibrated);
+    return injected;
 }
 
 static int prepare_imatrix(const std::string & imatrix_file,
@@ -398,6 +530,7 @@ int llama_quantize(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    std::string imatrix_expert_file;             // Story S14
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_type_option> tensor_type_opts;
@@ -452,6 +585,17 @@ int llama_quantize(int argc, char ** argv) {
             } else {
                 usage(argv[0]);
             }
+        } else if (strcmp(argv[arg_idx], "--imatrix-expert") == 0) {
+            // Story S14: per-expert imatrix sidecar from `llama-trace-moe
+            // --imatrix-out` (Story S13). Separate from --imatrix: the per-expert
+            // path uses the existing per-expert slicing loop in llama-quant.cpp;
+            // --imatrix remains the per-tensor path for non-routed tensors.
+            // The two coexist.
+            if (arg_idx < argc-1) {
+                imatrix_expert_file = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
         } else if (strcmp(argv[arg_idx], "--include-weights") == 0) {
             if (arg_idx < argc-1) {
                 included_weights.emplace_back(argv[++arg_idx]);
@@ -482,6 +626,14 @@ int llama_quantize(int argc, char ** argv) {
     std::vector<std::string> imatrix_datasets;
     std::unordered_map<std::string, std::vector<float>> imatrix_data;
     int m_last_call = prepare_imatrix(imatrix_file, imatrix_datasets, included_weights, excluded_weights, imatrix_data);
+
+    // Story S14: inject per-expert imatrix entries from the S13 sidecar. Done
+    // AFTER prepare_imatrix so the --include-weights / --exclude-weights filter
+    // (which targets per-tensor names) doesn't strip the per-expert enrichment.
+    // Merges into imatrix_data; the i_data population below picks up both paths.
+    if (!imatrix_expert_file.empty()) {
+        load_imatrix_expert(imatrix_expert_file, imatrix_data);
+    }
 
     std::vector<llama_model_imatrix_data> i_data;
     std::vector<llama_model_tensor_override> t_override;
