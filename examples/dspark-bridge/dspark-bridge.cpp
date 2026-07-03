@@ -351,16 +351,32 @@ static float sigmoidf(float x) {
 // sampler's output distribution is preserved regardless of the RNG stream
 // (Leviathan-2023), so statistical equivalence (KL divergence over many
 // samples) is the right correctness gate, not byte-equality.
-static float rng_uniform(DrafterState & dr) {
-    uint64_t x = dr.rng_state;
+static float rng_uniform(uint64_t & rng_state) {
+    uint64_t x = rng_state;
     x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
-    dr.rng_state = x;
-    uint64_t r = (x * 0x2545F4914F6CDD1DULL) >> 11;  // top 53 bits
+    rng_state = x;
+    uint64_t r = (x * 0x2545F4914F6CDD1DULL) >> 11;
     return (float) ((double) r / (double) (1ULL << 53));
+}
+static float rng_uniform(DrafterState & dr) {
+    return rng_uniform(dr.rng_state);
 }
 
 // Sample from a probability distribution over V tokens via cumulative sum
 // + binary search. Returns the sampled token id in [0, V).
+static int sample_from_dist(const float * p, int V, uint64_t & rng_state) {
+    thread_local std::vector<float> cum;
+    if ((int) cum.size() < V) cum.assign(V, 0.0f);
+    float s = 0.0f;
+    for (int i = 0; i < V; i++) { s += p[i]; cum[i] = s; }
+    float r = rng_uniform(rng_state) * s;
+    int lo = 0, hi = V - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (cum[mid] < r) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
 static int sample_from_dist(const float * p, int V, DrafterState & dr) {
     // Build cumulative sum in a scratch buffer (reusing p_logit is risky if
     // concurrency; allocate a small one on the stack for binary search).
@@ -435,6 +451,9 @@ struct DFlashState {
     std::vector<float> U_logit;            // (L, V)
     std::vector<float> bias_k;             // (L, V)  Markov bias
     std::vector<float> confidences;        // (L,)
+    // Story S32 AC4: cycle state.
+    uint64_t rng_state = 0x9E3779B97F4A7C15ULL;  // LCG for Leviathan rejection
+    std::vector<float> p_d;               // (gamma, V) draft distributions
 };
 
 // y[B x M] = x[B x K] @ W[M x K].T  — PyTorch nn.Linear convention.
@@ -1741,6 +1760,196 @@ int main(int argc, char ** argv) {
             write_floats(dflash.U_logit.data(), (size_t) L * dflash.V);
             write_floats(dflash.confidences.data(), (size_t) L);
             write_floats(dflash.h_final.data(),  (size_t) L * dflash.d);
+            continue;
+        } else if (op == "dspark_cycle_dflash") {
+            // Story S32 AC4: the fused DFlash cycle. Runs γ iterative
+            // dflash_forward calls (the draft() method: k=0 uses L=1, k>=1
+            // uses L=k+1 with teacher-forced prefix), then reuses the target
+            // feed + Leviathan rejection + KV rollback from dspark_cycle — all
+            // in C++, no Python, no binary p_d pipe.
+            if (!dflash.loaded) {
+                write_header_err("dflash not loaded; call dflash_load first");
+                continue;
+            }
+            if (!req.contains("anchor_token") || !req["anchor_token"].is_number_integer()) {
+                write_header_err("dspark_cycle_dflash requires anchor_token:int");
+                continue;
+            }
+            int anchor_tok = req["anchor_token"].get<int>();
+            if (anchor_tok < 0 || anchor_tok >= dflash.V) {
+                write_header_err("anchor_token out of range [0, V)");
+                continue;
+            }
+            // h_ctx from last_h_ctx cache or stdin. MUST drain stdin before
+            // any rejection so the protocol stays clean.
+            const int n_h_ctx = dflash.m * dflash.E;
+            std::vector<float> h_ctx(n_h_ctx, 0.0f);
+            if (!last_h_ctx.empty() && (int) last_h_ctx.size() == n_h_ctx) {
+                std::copy(last_h_ctx.begin(), last_h_ctx.end(), h_ctx.data());
+            } else if (n_h_ctx > 0 && !read_bytes_into(h_ctx.data(), (size_t) n_h_ctx * sizeof(float))) {
+                write_header_err("dspark_cycle_dflash: failed to read h_ctx payload");
+                continue;
+            }
+            if (ba.dflash_only) {
+                write_header_err("dspark_cycle_dflash requires the target model (not --dflash-only)");
+                continue;
+            }
+            // Optional seed override.
+            if (req.contains("seed") && req["seed"].is_number_integer()) {
+                dflash.rng_state = (uint64_t) req["seed"].get<int64_t>() | 0x9E3779B97F4A7C15ULL;
+            }
+            const int g  = dflash.gamma;
+            const int Vd = dflash.V;
+            const int d_df = dflash.d;
+
+            // --- 1. γ iterative dflash_forward calls (the draft() method). ---
+            // k=0: L=1, prev_drafts=nullptr → position 0
+            // k>=1: L=k+1, prev_drafts=draft_tokens[0..k-1] → position L-1=k
+            dflash.p_d.assign((size_t) g * Vd, 0.0f);
+            std::vector<int32_t> draft_tokens(g);
+            std::vector<float>   confidences(g);
+            for (int k = 0; k < g; k++) {
+                int n_prev_k = k;
+                int L_k = (k == 0) ? 1 : (k + 1);
+                const int32_t * prev_k = (k == 0) ? nullptr : draft_tokens.data();
+                dflash_forward(dflash, anchor_tok, h_ctx.data(), prev_k, n_prev_k, L_k);
+                int pos_k = (k == 0) ? 0 : (L_k - 1);
+                const float * logits_k = dflash.U_logit.data() + (size_t) pos_k * Vd;
+                float * p_d_k = dflash.p_d.data() + (size_t) k * Vd;
+                // Copy logits → p_d, then softmax in place.
+                for (int v = 0; v < Vd; v++) p_d_k[v] = logits_k[v];
+                (void) softmax_inplace(p_d_k, Vd);
+                draft_tokens[k] = (int32_t) argmax(p_d_k, Vd);
+                confidences[k] = dflash.confidences[pos_k];
+            }
+
+            // --- 2. C++ target feed of [anchor, *draft_tokens]. ---
+            std::vector<llama_token> feed_tokens;
+            feed_tokens.push_back((llama_token) anchor_tok);
+            for (int k = 0; k < g; k++) feed_tokens.push_back((llama_token) draft_tokens[k]);
+            int n_feed = (int) feed_tokens.size();   // gamma+1
+            std::vector<float> p_t((size_t) n_feed * Vd, 0.0f);
+            bool feed_ok = true;
+            size_t f_idx = 0;
+            llama_pos n_pre = n_past;
+            while (f_idx < (size_t) n_feed) {
+                size_t chunk = std::min((size_t) n_batch, (size_t) n_feed - f_idx);
+                llama_batch batch = llama_batch_init((int) chunk, 0, 1);
+                for (size_t i = 0; i < chunk; i++) {
+                    batch.token[i]    = feed_tokens[f_idx + i];
+                    batch.pos[i]      = n_past + (llama_pos) i;
+                    batch.n_seq_id[i] = 1;
+                    batch.seq_id[i][0] = seq_id;
+                    batch.logits[i]   = 1;
+                }
+                batch.n_tokens = (int) chunk;
+                if (llama_decode(ctx, batch) != 0) {
+                    LOG_ERR("dspark_cycle_dflash feed decode failed\n");
+                    feed_ok = false;
+                    llama_batch_free(batch);
+                    break;
+                }
+                for (size_t i = 0; i < chunk; i++) {
+                    const float * lg = llama_get_logits_ith(ctx, (int32_t) i);
+                    if (!lg) { feed_ok = false; break; }
+                    float * dst = p_t.data() + (size_t) (f_idx + i) * Vd;
+                    for (int v = 0; v < Vd; v++) dst[v] = lg[v];
+                }
+                n_past += (llama_pos) chunk;
+                f_idx += chunk;
+                llama_batch_free(batch);
+            }
+            if (!feed_ok) { write_header_err("dspark_cycle_dflash target feed failed"); continue; }
+            // Update last_hidden to the LAST fed token's hidden state.
+            if (ba.embedding) {
+                const float * em_last = llama_get_embeddings_ith(ctx, (int32_t) (n_feed - 1));
+                if (em_last) last_hidden.assign(em_last, em_last + n_embd);
+            }
+            // Softmax each target distribution row in place.
+            for (int k = 0; k < n_feed; k++) {
+                (void) softmax_inplace(p_t.data() + (size_t) k * Vd, Vd);
+            }
+
+            // --- 3. C++ rejection sampler (Leviathan-2023). ---
+            std::vector<int32_t> accepted_tokens;
+            accepted_tokens.reserve(g + 1);
+            int n_accepted = 0;
+            int reject_position = -1;
+            for (int k = 0; k < g; k++) {
+                int x_k = draft_tokens[k];
+                const float * q = dflash.p_d.data() + (size_t) k * Vd;
+                const float * p = p_t.data() + (size_t) k * Vd;
+                float q_x = q[x_k];
+                float p_x = p[x_k];
+                float ratio = (q_x <= 0.0f) ? 1.0f : std::min(1.0f, p_x / q_x);
+                float r = rng_uniform(dflash.rng_state);
+                if (r < ratio) {
+                    accepted_tokens.push_back((int32_t) x_k);
+                    n_accepted += 1;
+                    continue;
+                }
+                // Resample from normalized(max(0, p - q)).
+                std::vector<float> resample_scratch((size_t) Vd);
+                for (int v = 0; v < Vd; v++) {
+                    float diff = p[v] - q[v];
+                    resample_scratch[v] = diff > 0.0f ? diff : 0.0f;
+                }
+                int x_star = sample_from_dist(resample_scratch.data(), Vd, dflash.rng_state);
+                accepted_tokens.push_back((int32_t) x_star);
+                reject_position = k;
+                break;
+            }
+            int bonus_token = -1;
+            if (reject_position < 0) {
+                const float * p_bonus = p_t.data() + (size_t) g * Vd;
+                bonus_token = sample_from_dist(p_bonus, Vd, dflash.rng_state);
+                accepted_tokens.push_back((int32_t) bonus_token);
+            }
+
+            // --- 4. KV-cache rollback for the un-verified suffix. ---
+            size_t committed = (size_t) (n_past - n_feed);  // n_pre
+            if (reject_position < 0) {
+                committed += (size_t) (g + 1);
+            } else {
+                committed += (size_t) (reject_position + 1);
+            }
+            if ((size_t) n_past > committed) {
+                llama_memory_seq_rm(llama_get_memory(ctx), seq_id, (llama_pos) committed, -1);
+                n_past = (llama_pos) committed;
+            }
+            // Update last_hidden + last_h_ctx at the committed position.
+            if (ba.embedding && committed > 0) {
+                const float * em_new = llama_get_embeddings_ith(ctx, (int32_t) (committed - 1));
+                if (em_new) last_hidden.assign(em_new, em_new + n_embd);
+                // Multi-layer context: extract from each enabled layer.
+                if (n_extract > 0) {
+                    std::vector<float> h_ctx_new;
+                    h_ctx_new.reserve((size_t) n_extract * n_embd);
+                    for (int32_t ei = 0; ei < n_extract; ei++) {
+                        int32_t lid = ba.extract_layers[ei];
+                        const float * layer = (const float *) llama_get_embeddings_layer_inp(ctx, (uint32_t) lid);
+                        if (!layer) { LOG_ERR("dspark_cycle_dflash: layer_inp(lid=%d) null at committed=%zu\n", lid, committed); break; }
+                        // For single-chunk feed: index = committed-1.
+                        const float * src = layer + (size_t) (committed - 1) * n_embd;
+                        h_ctx_new.insert(h_ctx_new.end(), src, src + n_embd);
+                    }
+                    if ((int) h_ctx_new.size() == n_h_ctx) last_h_ctx = h_ctx_new;
+                }
+            }
+            int new_anchor = accepted_tokens.back();
+            (void) new_anchor;
+
+            // --- 5. Return. ---
+            int n_out = (int) accepted_tokens.size();
+            write_header_ok_kv({
+                {"n_accepted",  (int64_t) n_accepted},
+                {"n_committed", (int64_t) n_out},
+                {"reject_position", (int64_t) reject_position},
+                {"bonus", (int64_t) bonus_token},
+                {"n_anchor", (int64_t) new_anchor},
+            });
+            write_bytes(accepted_tokens.data(), (size_t) n_out * sizeof(int32_t));
+            write_floats(confidences.data(), (size_t) g);
             continue;
         } else {
             write_header_err("unknown op: " + op);
