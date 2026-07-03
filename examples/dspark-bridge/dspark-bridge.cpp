@@ -128,6 +128,12 @@ struct BridgeArgs {
     // [H(l_1);...;H(l_m)] for the LAST fed token) to the response body, and
     // the header carries "embd_layers": m. Default empty = current behavior.
     std::vector<int32_t> extract_layers;
+    // Story S32: --dflash-only mode skips model loading entirely and serves
+    // only dflash_load + dflash_forward. The D5 model (247 GB GPU) becomes
+    // optional — the C++ forward correctness test doesn't need the target,
+    // just the checkpoint + a synthetic h_ctx sent via stdin. Frees the
+    // bridge to run alongside an in-flight capture without GPU contention.
+    bool dflash_only = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -208,10 +214,11 @@ static BridgeArgs parse_args(int argc, char ** argv) {
             }
         }
         else if (s == "-h"  || s == "--help")      { print_usage(argv[0]); std::exit(0); }
+        else if (s == "--dflash-only") a.dflash_only = true;
         else LOG_WRN("ignoring unknown arg: %s\n", s.c_str());
     }
-    if (a.model_path.empty()) {
-        LOG_ERR("error: -m MODEL is required\n");
+    if (!a.dflash_only && a.model_path.empty()) {
+        LOG_ERR("error: -m MODEL is required (or use --dflash-only)\n");
         print_usage(argv[0]);
         std::exit(1);
     }
@@ -372,6 +379,291 @@ static int sample_from_dist(const float * p, int V, DrafterState & dr) {
     return lo;
 }
 
+// ===========================================================================
+// Story S32: DFlash transformer drafter (C++ port of dflash_drafter.py).
+// 4-layer pre-norm transformer, d=2048, KV-injection self-attn (w=128),
+// SwiGLU FFN, low-rank LM head + Markov head + confidence head.
+// Paper-faithful DSpark §3.1 Eq. 2 — context is concat'd to K/V along the
+// sequence dimension; self-attn attends over [ctx(×m); draft(×L)].
+// ===========================================================================
+
+struct DFlashState {
+    bool loaded = false;
+    // Config (from the sidecar model_cfg).
+    int V = 0, E = 0, m = 0, d = 0;
+    int n_layers = 0, gamma = 0;
+    int n_heads = 0, head_dim = 0;
+    int ffn_hidden = 0, sliding_window = 0;
+    int r_lm = 0, r_markov = 0, ctx_dim = 0;
+    // mmap'd .bin region (kept alive for the process lifetime).
+    void * bin_base = nullptr;
+    size_t bin_size = 0;
+    // Weight pointers into bin_base. PyTorch Linear weights are stored
+    // (out, in) row-major; C++ uses gemm_lin (CblasTrans) for those.
+    const float * tok_emb = nullptr;       // (V, d)        embedding lookup
+    const float * pos_emb = nullptr;       // (gamma, d)
+    const float * ctx_W_c = nullptr;       // (d*m, ctx_dim) Linear(out=d*m, in=ctx_dim)
+    const float * ctx_norm = nullptr;      // (d,)          RMSNorm weight
+    struct Block {
+        const float * norm1;               // (d,)
+        const float * qkv;                // (3d, d)       Linear
+        const float * o;                  // (d, d)        Linear
+        const float * norm2;              // (d,)
+        const float * ffn_gate;           // (h, d)        Linear
+        const float * ffn_up;             // (h, d)        Linear
+        const float * ffn_down;           // (d, h)        Linear
+    };
+    std::vector<Block> blocks;
+    const float * final_norm = nullptr;    // (d,)
+    const float * lm_A = nullptr;          // (r_lm, d)     Linear
+    const float * lm_B = nullptr;          // (V, r_lm)     Linear
+    const float * W1m = nullptr;           // (V, r_markov) embedding lookup
+    const float * W2m = nullptr;           // (V, r_markov) Linear(out=V, in=r_markov)
+    const float * w_conf = nullptr;        // (1, d+r_markov) Linear
+    // Scratch buffers (sized at load time, reused across calls).
+    std::vector<float> ctx_proj_out;      // (m, d)
+    std::vector<float> x_draft;            // (L, d)
+    std::vector<float> norm_out;           // (L, d)
+    std::vector<float> qkv_out;            // (S, 3d)
+    std::vector<float> q_full;            // (S, d) — concatenated ctx+draft for QKV
+    std::vector<float> scores;             // (L, S) per head
+    std::vector<float> attn_out;           // (L, d)
+    std::vector<float> ffn_g, ffn_u;       // (L, h) ×2
+    std::vector<float> ffn_out;            // (L, d)
+    std::vector<float> h_final;            // (L, d)
+    std::vector<float> lm_proj;             // (L, r_lm)
+    std::vector<float> U_logit;            // (L, V)
+    std::vector<float> bias_k;             // (L, V)  Markov bias
+    std::vector<float> confidences;        // (L,)
+};
+
+// y[B x M] = x[B x K] @ W[M x K].T  — PyTorch nn.Linear convention.
+// W stored (out=M, in=K) row-major; CblasTrans reads it as (K, M).
+#ifdef USE_ACCELERATE
+static void gemm_lin(const float * x, const float * W, float * y,
+                     int B, int K, int M) {
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+               B, M, K, 1.0f, x, K, W, K, 0.0f, y, M);
+}
+#else
+static void gemm_lin(const float * x, const float * W, float * y,
+                     int B, int K, int M) {
+    // y[B,M] = x[B,K] @ W[M,K].T. W is (out=M, in=K) row-major (PyTorch Linear).
+    #pragma omp parallel for
+    for (int b = 0; b < B; b++) {
+        const float * xb = x + (size_t) b * K;
+        float * yb = y + (size_t) b * M;
+        for (int m = 0; m < M; m++) {
+            const float * wm = W + (size_t) m * K;  // W row m (length K)
+            float s = 0.0f;
+            for (int k = 0; k < K; k++) s += xb[k] * wm[k];
+            yb[m] = s;
+        }
+    }
+}
+#endif
+
+// RMSNorm over the last dim (d). x and w are float*; out can alias x.
+static void rmsnorm(const float * x, const float * w, float * out, int B, int d) {
+    const float eps = 1e-6f;
+    for (int b = 0; b < B; b++) {
+        const float * xb = x + (size_t) b * d;
+        float * ob = out + (size_t) b * d;
+        float sq = 0.0f;
+        for (int i = 0; i < d; i++) sq += xb[i] * xb[i];
+        float inv = 1.0f / sqrtf(sq / d + eps);
+        for (int i = 0; i < d; i++) ob[i] = xb[i] * inv * w[i];
+    }
+}
+
+// Story S32 AC3: DFlash forward pass (one iteration of the iterative drafter).
+// Mirrors DFlashDrafter.forward() in dflash_drafter.py EXACTLY (pos-faithful).
+//
+// Inputs (caller fills dflash.* scratch / state):
+//   anchor_tok : int     — last committed target token.
+//   h_ctx      : (m, E)  — m captured target-layer hidden states at the anchor.
+//   prev_drafts: int[L-1] (may be empty when L=γ, the first iteration).
+//   L          : int     — sequence length = 1 + n_prev (or γ when no prev).
+//
+// Outputs (written into dflash.* scratch):
+//   logits      : (L, V)  — draft token distributions per position.
+//   confidences : (L,)    — per-position confidence.
+//   h_final     : (L, d)  — final-layer hidden (for debugging / future KV-cache).
+static void dflash_forward(DFlashState & df, int anchor_tok,
+                           const float * h_ctx,
+                           const int32_t * prev_drafts, int n_prev,
+                           int L) {
+    const int d = df.d, m = df.m, V = df.V;
+    const int H = df.n_heads, hd = df.head_dim;
+    const int rlm = df.r_lm, rmk = df.r_markov;
+    const int gamma = df.gamma;
+    const int w = df.sliding_window;
+    // inputs[k] = anchor when n_prev==0 (the "expand" case from Python),
+    // else [anchor, prev_drafts[0], ..., prev_drafts[L-2]]. Used by the
+    // token embedding, Markov head, and confidence head — MUST match the
+    // Python DFlashDrafter.forward() exactly.
+    auto input_at = [&](int k) -> int {
+        if (n_prev == 0) return anchor_tok;
+        return (k == 0) ? anchor_tok : prev_drafts[k - 1];
+    };
+
+    // 1. Project target context: ctx = RMSnorm(h_ctx_flat @ W_c.T).
+    //    h_ctx (m, E) → flat (1, m*E=ctx_dim) → @ W_c.T → (1, d*m) → reshape (m, d).
+    //    ctx_W_c is (d*m, ctx_dim) [PyTorch Linear (out=d*m, in=ctx_dim)].
+    df.ctx_proj_out.assign((size_t) m * d, 0.0f);
+    gemm_lin(h_ctx, df.ctx_W_c, df.ctx_proj_out.data(), 1, df.ctx_dim, m * d);
+    rmsnorm(df.ctx_proj_out.data(), df.ctx_norm, df.ctx_proj_out.data(), m, d);
+
+    // 2. Token + position embeddings.
+    //    inputs[k] = anchor_tok when n_prev==0, else [anchor, prev[0..n_prev-1]].
+    //    positions 0..L-1, pos_emb[:L].
+    df.x_draft.assign((size_t) L * d, 0.0f);
+    for (int k = 0; k < L; k++) {
+        // inputs[k] = anchor when n_prev==0 (the "expand" case from Python),
+        // else [anchor, prev_drafts[0], ..., prev_drafts[L-2]].
+        int tok = input_at(k);
+        const float * emb = df.tok_emb + (size_t) tok * d;
+        const float * pos = df.pos_emb + (size_t) k * d;
+        float * xk = df.x_draft.data() + (size_t) k * d;
+        for (int i = 0; i < d; i++) xk[i] = emb[i] + pos[i];
+    }
+
+    // 3. Transformer blocks (pre-norm KV-injection self-attn + SwiGLU).
+    const int S = m + L;  // full sequence length (context + draft)
+    for (int il = 0; il < df.n_layers; il++) {
+        const auto & blk = df.blocks[il];
+        // --- 3a. Pre-norm RMSNorm before self-attn.
+        rmsnorm(df.x_draft.data(), blk.norm1, df.norm_out.data(), L, d);
+        // --- 3b. Self-attn: concat ctx + draft, project QKV, attend, project out.
+        // qkv_full: (S, 3d) = concat(norm_out[ctx? no — ctx is already projected],
+        //   norm_out[draft]) @ qkv.T. But the Python concat's [ctx, x_norm1]:
+        //   ctx is (m, d) and x_norm1 is (L, d), giving (m+L=S, d) → @ qkv.T → (S, 3d).
+        // Build the concatenated sequence (S, d) into q_full temporarily.
+        df.q_full.assign((size_t) S * d, 0.0f);
+        for (int i = 0; i < m; i++) {
+            const float * src = df.ctx_proj_out.data() + (size_t) i * d;
+            float * dst = df.q_full.data() + (size_t) i * d;
+            for (int j = 0; j < d; j++) dst[j] = src[j];
+        }
+        for (int i = 0; i < L; i++) {
+            const float * src = df.norm_out.data() + (size_t) i * d;
+            float * dst = df.q_full.data() + (size_t) (m + i) * d;
+            for (int j = 0; j < d; j++) dst[j] = src[j];
+        }
+        // qkv_out: (S, 3d) row-major, interleaved [Q(d), K(d), V(d)] per position.
+        // After Python's reshape (B, S, 3, H, hd):
+        //   Q[h, q, :] at qkv_out + q*3d + h*hd
+        //   K[h, j, :] at qkv_out + j*3d + d + h*hd
+        //   V[h, j, :] at qkv_out + j*3d + 2*d + h*hd
+        df.qkv_out.assign((size_t) S * 3 * d, 0.0f);
+        gemm_lin(df.q_full.data(), blk.qkv, df.qkv_out.data(), S, d, 3 * d);
+        const float * qkv_base = df.qkv_out.data();
+        // For each head h, compute attention for the L draft query positions
+        // (full-seq positions m..m+L-1) against all S keys.
+        df.attn_out.assign((size_t) L * d, 0.0f);
+        // We accumulate per-head output into (L, d): head h writes dims [h*hd .. (h+1)*hd).
+        for (int h = 0; h < H; h++) {
+            // For each draft query position (full-seq idx q = m+i, i=0..L-1):
+            df.scores.assign((size_t) L * S, 0.0f);
+            for (int i = 0; i < L; i++) {
+                int q = m + i;
+                const float * qi = qkv_base + (size_t) q * 3 * d + (size_t) h * hd;
+                // Compute scores for all S keys + mask + softmax in one pass.
+                float * sc = df.scores.data() + (size_t) i * S;
+                float mx = -1e30f;
+                for (int j = 0; j < S; j++) {
+                    bool is_ctx = (j < m);
+                    bool causal_win = (j >= m) && (j <= q) && (j >= q - w + 1);
+                    if (!(is_ctx || causal_win)) { sc[j] = -1e30f; continue; }
+                    const float * kj = qkv_base + (size_t) j * 3 * d + (size_t) d + (size_t) h * hd;
+                    float s = 0.0f;
+                    for (int e = 0; e < hd; e++) s += qi[e] * kj[e];
+                    s /= sqrtf((float) hd);
+                    sc[j] = s;
+                    if (s > mx) mx = s;
+                }
+                // Softmax.
+                float sum = 0.0f;
+                for (int j = 0; j < S; j++) {
+                    if (sc[j] <= -1e29f) { sc[j] = 0.0f; continue; }
+                    sc[j] = expf(sc[j] - mx);
+                    sum += sc[j];
+                }
+                float inv = 1.0f / sum;
+                // out[i, h, :] = sum_j sc[j] * V[h, j, :]
+                float * out_i = df.attn_out.data() + (size_t) i * d + (size_t) h * hd;
+                for (int e = 0; e < hd; e++) out_i[e] = 0.0f;
+                for (int j = 0; j < S; j++) {
+                    if (sc[j] == 0.0f) continue;
+                    float w_ = sc[j] * inv;
+                    const float * vj = qkv_base + (size_t) j * 3 * d + (size_t) 2 * d + (size_t) h * hd;
+                    for (int e = 0; e < hd; e++) out_i[e] += w_ * vj[e];
+                }
+            }
+        }
+        // Output projection: (L, d) = attn_out @ o.T (Linear: d→d).
+        std::vector<float> proj_out((size_t) L * d, 0.0f);
+        gemm_lin(df.attn_out.data(), blk.o, proj_out.data(), L, d, d);
+        // Residual add.
+        for (int i = 0; i < L * d; i++) df.x_draft[i] += proj_out[i];
+
+        // --- 3c. Pre-norm RMSNorm before FFN.
+        rmsnorm(df.x_draft.data(), blk.norm2, df.norm_out.data(), L, d);
+        // --- 3d. SwiGLU FFN: silu(x@gate.T) * (x@up.T) → @down.T.
+        df.ffn_g.assign((size_t) L * df.ffn_hidden, 0.0f);
+        df.ffn_u.assign((size_t) L * df.ffn_hidden, 0.0f);
+        gemm_lin(df.norm_out.data(), blk.ffn_gate, df.ffn_g.data(), L, d, df.ffn_hidden);
+        gemm_lin(df.norm_out.data(), blk.ffn_up,   df.ffn_u.data(), L, d, df.ffn_hidden);
+        for (int i = 0; i < L * df.ffn_hidden; i++) {
+            float g = df.ffn_g[i];
+            // silu(g) = g * sigmoid(g)
+            float silu = g / (1.0f + expf(-g));
+            df.ffn_g[i] = silu * df.ffn_u[i];  // reuse ffn_g as the intermediate
+        }
+        df.ffn_out.assign((size_t) L * d, 0.0f);
+        gemm_lin(df.ffn_g.data(), blk.ffn_down, df.ffn_out.data(), L, df.ffn_hidden, d);
+        // Residual add.
+        for (int i = 0; i < L * d; i++) df.x_draft[i] += df.ffn_out[i];
+    }
+
+    // 4. Final RMSNorm.
+    df.h_final.assign((size_t) L * d, 0.0f);
+    rmsnorm(df.x_draft.data(), df.final_norm, df.h_final.data(), L, d);
+
+    // 5. Low-rank LM head: U = (h_final @ lm_A.T) @ lm_B.T → (L, V).
+    df.lm_proj.assign((size_t) L * rlm, 0.0f);
+    gemm_lin(df.h_final.data(), df.lm_A, df.lm_proj.data(), L, d, rlm);
+    df.U_logit.assign((size_t) L * V, 0.0f);
+    gemm_lin(df.lm_proj.data(), df.lm_B, df.U_logit.data(), L, rlm, V);
+
+    // 6. Markov head + final logits. For position k, the Markov bias uses
+    //    inputs[k] (the PREVIOUS token at that position). In the forward,
+    //    inputs[0]=anchor and inputs[k]=prev_drafts[k-1] for k>0.
+    df.bias_k.assign((size_t) L * V, 0.0f);
+    for (int k = 0; k < L; k++) {
+        int prev_tok = input_at(k);
+        const float * emb_prev = df.W1m + (size_t) prev_tok * rmk;  // (rmk,)
+        float * bias = df.bias_k.data() + (size_t) k * V;
+        // bias = W1m[prev_tok] @ W2m.T  (Linear: r_markov → V).
+        gemm_lin(emb_prev, df.W2m, bias, 1, rmk, V);
+        // logits[k] = U[k] + bias[k].
+        float * UK = df.U_logit.data() + (size_t) k * V;
+        for (int v = 0; v < V; v++) UK[v] += bias[v];
+    }
+
+    // 7. Confidence head: c = sigmoid(w_conf . [h_final ; W1m[inputs[k]]]).
+    df.confidences.assign((size_t) L, 0.0f);
+    for (int k = 0; k < L; k++) {
+        int prev_tok = input_at(k);
+        const float * emb_prev = df.W1m + (size_t) prev_tok * rmk;
+        const float * hk = df.h_final.data() + (size_t) k * d;
+        float cl = 0.0f;
+        for (int i = 0; i < d; i++) cl += df.w_conf[i] * hk[i];
+        for (int j = 0; j < rmk; j++) cl += df.w_conf[d + j] * emb_prev[j];
+        df.confidences[k] = sigmoidf(cl);
+    }
+}
+
 int main(int argc, char ** argv) {
 
     std::setlocale(LC_NUMERIC, "C");
@@ -392,34 +684,38 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    LOG_INF("loading model: %s (ngl=%d, n_ctx=%d, embedding=%d)\n",
-            ba.model_path.c_str(), ba.ngl, ba.n_ctx, ba.embedding ? 1 : 0);
-
-    auto init = common_init_from_params(params);
-    llama_model * model = init->model();
-    llama_context * ctx  = init->context();
-    if (!model || !ctx) {
-        LOG_ERR("failed to load model\n");
-        return 1;
-    }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-    const int32_t V       = llama_vocab_n_tokens(vocab);
-    const int32_t n_embd  = ba.embedding ? (int32_t) llama_model_n_embd(model) : 0;
-    const int32_t n_extract = (int32_t) ba.extract_layers.size();
-    const int32_t n_layer   = (int32_t) llama_model_n_layer(model);
-    // Story S31 Option B: enable per-layer hidden-state extraction. Each lid
-    // makes llama_get_embeddings_layer_inp(ctx, lid) return a valid pointer
-    // (n_tokens × n_embd row-major) after the next llama_decode. Validate
-    // each lid is in [0, n_layer) so a typo doesn't silently abort decode.
-    for (int32_t lid : ba.extract_layers) {
-        if (lid < 0 || lid >= n_layer) {
-            LOG_ERR("--extract-layers id %d out of range [0, %d)\n", lid, n_layer);
+    llama_model * model = nullptr;
+    llama_context * ctx  = nullptr;
+    if (!ba.dflash_only) {
+        LOG_INF("loading model: %s (ngl=%d, n_ctx=%d, embedding=%d)\n",
+                ba.model_path.c_str(), ba.ngl, ba.n_ctx, ba.embedding ? 1 : 0);
+        auto init = common_init_from_params(params);
+        model = init->model();
+        ctx  = init->context();
+        if (!model || !ctx) {
+            LOG_ERR("failed to load model\n");
             return 1;
         }
-        llama_set_embeddings_layer_inp(ctx, (uint32_t) lid, true);
-        LOG_INF("extract-layer enabled: lid=%d (input to that layer = output of layer %d)\n",
-                lid, lid - 1);
+    } else {
+        LOG_INF("--dflash-only: skipping model load; serves dflash_load + dflash_forward only\n");
+    }
+
+    const llama_vocab * vocab = ba.dflash_only ? nullptr : llama_model_get_vocab(model);
+    const int32_t V       = ba.dflash_only ? 0 : llama_vocab_n_tokens(vocab);
+    const int32_t n_embd  = (ba.embedding && !ba.dflash_only) ? (int32_t) llama_model_n_embd(model) : 0;
+    const int32_t n_extract = (int32_t) ba.extract_layers.size();
+    const int32_t n_layer   = ba.dflash_only ? 0 : (int32_t) llama_model_n_layer(model);
+    // Story S31 Option B: enable per-layer hidden-state extraction.
+    if (!ba.dflash_only) {
+        for (int32_t lid : ba.extract_layers) {
+            if (lid < 0 || lid >= n_layer) {
+                LOG_ERR("--extract-layers id %d out of range [0, %d)\n", lid, n_layer);
+                return 1;
+            }
+            llama_set_embeddings_layer_inp(ctx, lid, true);
+            LOG_INF("extract-layer enabled: lid=%d (input to that layer = output of layer %d)\n",
+                    lid, lid > 0 ? lid - 1 : 0);
+        }
     }
     const llama_seq_id seq_id = 0;
 
@@ -428,25 +724,31 @@ int main(int argc, char ** argv) {
     // enable_thinking checkbox) internally — equivalent to
     // `llama-cli --jinja -cnv -st`. This is the path the DSpark training-
     // data capture pipeline uses to produce non-thinking-mode responses.
-    common_chat_templates_ptr chat_tmpls = common_chat_templates_init(model, /*override*/ "", "", "");
-    if (!chat_tmpls) {
-        LOG_ERR("failed to init chat templates from model\n");
-        return 1;
+    common_chat_templates_ptr chat_tmpls;
+    if (!ba.dflash_only) {
+        chat_tmpls = common_chat_templates_init(model, /*override*/ "", "", "");
+        if (!chat_tmpls) {
+            LOG_ERR("failed to init chat templates from model\n");
+            return 1;
+        }
     }
 
-    LOG_INF("ready: V=%d, n_embd=%d\n", V, n_embd);
+    LOG_INF("ready: V=%d, n_embd=%d%s\n", V, n_embd,
+            ba.dflash_only ? " (dflash-only)" : "");
 
     // Track the session's KV length so we can build batches with correct pos.
     llama_pos n_past = 0;
-    const int n_batch = llama_n_batch(ctx);
+    const int n_batch = ba.dflash_only ? 0 : llama_n_batch(ctx);
     std::vector<llama_token> tok_buf;
-    tok_buf.reserve(n_batch);
+    if (!ba.dflash_only) tok_buf.reserve(n_batch);
 
     // Story S30: drafter state (loaded lazily via the drafter_load op).
     DrafterState drafter;
+    DFlashState   dflash;
     // Scratch for the hidden state collected from the most recent feed
     // (the target's h_anchor for the next draft cycle).
     std::vector<float> last_hidden;  // length n_embd, or empty if !out.embedding
+    std::vector<float> last_h_ctx;  // m*n_embd multi-layer context (S31 Option B)
 
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -695,7 +997,11 @@ int main(int argc, char ** argv) {
             int32_t best_tok = best;
             write_bytes(&best_tok, sizeof(int32_t));
             if (ba.embedding) write_floats(last_hidden.data(), (size_t) n_embd);
-            if (n_extract > 0) write_floats(h_ctx_layers.data(), h_ctx_layers.size());
+            if (n_extract > 0) {
+                write_floats(h_ctx_layers.data(), h_ctx_layers.size());
+                // Story S32: persist the multi-layer context for dflash_forward.
+                last_h_ctx = h_ctx_layers;
+            }
             continue;
         } else if (op == "drafter_load") {
             // Story S30 AC1: load the trained drafter weights from a flat
@@ -1274,6 +1580,167 @@ int main(int argc, char ** argv) {
             });
             write_bytes(accepted_tokens.data(), (size_t) n_out * sizeof(int32_t));
             write_floats(confidences.data(), (size_t) g);
+            continue;
+        } else if (op == "dflash_load") {
+            // Story S32 AC2: load DFlash transformer weights from a flat .bin
+            // produced by glm52_dspark/export_checkpoint_dflash.py.
+            if (!req.contains("bin") || !req["bin"].is_string()) {
+                write_header_err("dflash_load requires bin=<path>");
+                continue;
+            }
+            std::string bin_path = req["bin"].get<std::string>();
+            // Sidecar path: strip ".bin" suffix, append ".json".
+            // (Export writes {stem}_dflash.bin + {stem}_dflash.json, so the
+            // sidecar is bin_path without the trailing .bin + .json.)
+            std::string json_path = bin_path;
+            if (json_path.size() > 4 && json_path.substr(json_path.size() - 4) == ".bin")
+                json_path = json_path.substr(0, json_path.size() - 4);
+            json_path += ".json";
+            std::ifstream jf(json_path);
+            if (!jf) { write_header_err("cannot open sidecar: " + json_path); continue; }
+            nlohmann::json sidecar;
+            jf >> sidecar;
+            // Parse model_cfg.
+            auto & cfg = sidecar["model_cfg"];
+            dflash.V    = cfg.value("vocab_size", 0);
+            dflash.E    = cfg.value("target_hidden_dim", 0);
+            dflash.m    = cfg.value("n_extract_layers", 0);
+            dflash.d    = cfg.value("drafter_dim", 0);
+            dflash.n_layers = cfg.value("n_layers", 0);
+            dflash.gamma    = cfg.value("gamma", 0);
+            dflash.n_heads  = cfg.value("n_heads", 0);
+            dflash.head_dim = cfg.value("head_dim", 0);
+            dflash.ffn_hidden = cfg.value("ffn_mult", 4) * dflash.d;
+            dflash.sliding_window = cfg.value("sliding_window", 128);
+            dflash.r_lm      = cfg.value("r_lm", 0);
+            dflash.r_markov  = cfg.value("r_markov", 0);
+            dflash.ctx_dim   = dflash.m * dflash.E;
+            // mmap the .bin.
+            int fd = open(bin_path.c_str(), O_RDONLY);
+            if (fd < 0) { write_header_err("cannot open bin: " + bin_path); continue; }
+            struct stat st;
+            if (fstat(fd, &st) != 0) { close(fd); write_header_err("fstat failed"); continue; }
+            size_t sz = (size_t) st.st_size;
+            void * base = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (base == MAP_FAILED) { close(fd); write_header_err("mmap failed"); continue; }
+            close(fd);
+            dflash.bin_base = base;
+            dflash.bin_size = sz;
+            // name → pointer lookup (sidecar tensors have "byte_offset").
+            auto map_t = [&](const std::string & name) -> const float * {
+                for (const auto & t : sidecar["tensors"]) {
+                    if (t["name"] == name) {
+                        long off = t["byte_offset"].get<long>();
+                        return reinterpret_cast<const float *>((char *) base + off);
+                    }
+                }
+                LOG_ERR("dflash tensor not found: %s\n", name.c_str());
+                return nullptr;
+            };
+            dflash.tok_emb  = map_t("tok_emb.weight");
+            dflash.pos_emb  = map_t("pos_emb");
+            dflash.ctx_W_c  = map_t("ctx_proj.W_c.weight");
+            dflash.ctx_norm = map_t("ctx_proj.norm.weight");
+            dflash.blocks.resize(dflash.n_layers);
+            for (int i = 0; i < dflash.n_layers; i++) {
+                std::string p = "blocks." + std::to_string(i) + ".";
+                dflash.blocks[i].norm1     = map_t(p + "norm1.weight");
+                dflash.blocks[i].qkv       = map_t(p + "self_attn.qkv.weight");
+                dflash.blocks[i].o        = map_t(p + "self_attn.o.weight");
+                dflash.blocks[i].norm2     = map_t(p + "norm2.weight");
+                dflash.blocks[i].ffn_gate  = map_t(p + "ffn.gate.weight");
+                dflash.blocks[i].ffn_up    = map_t(p + "ffn.up.weight");
+                dflash.blocks[i].ffn_down  = map_t(p + "ffn.down.weight");
+            }
+            dflash.final_norm = map_t("final_norm.weight");
+            dflash.lm_A       = map_t("lm_A.weight");
+            dflash.lm_B       = map_t("lm_B.weight");
+            dflash.W1m        = map_t("W1m.weight");
+            dflash.W2m        = map_t("W2m.weight");
+            dflash.w_conf     = map_t("w_conf.weight");
+            // Dim check (skipped in --dflash-only mode where there's no model V).
+            if (!ba.dflash_only && dflash.V != V) {
+                write_header_err("dflash V mismatch: ckpt V=" + std::to_string(dflash.V)
+                                 + " model V=" + std::to_string(V));
+                dflash.loaded = false; continue;
+            }
+            // Allocate scratch (Lmax = gamma; Smax = m + gamma).
+            int Lmax = dflash.gamma;
+            int Smax = dflash.m + Lmax;
+            dflash.x_draft.assign   ((size_t) Lmax * dflash.d, 0.0f);
+            dflash.norm_out.assign  ((size_t) Lmax * dflash.d, 0.0f);
+            dflash.qkv_out.assign   ((size_t) Smax * 3 * dflash.d, 0.0f);
+            dflash.q_full.assign    ((size_t) Smax * dflash.d, 0.0f);
+            dflash.scores.assign    ((size_t) Lmax * Smax, 0.0f);
+            dflash.attn_out.assign  ((size_t) Lmax * dflash.d, 0.0f);
+            dflash.ffn_g.assign     ((size_t) Lmax * dflash.ffn_hidden, 0.0f);
+            dflash.ffn_u.assign     ((size_t) Lmax * dflash.ffn_hidden, 0.0f);
+            dflash.ffn_out.assign   ((size_t) Lmax * dflash.d, 0.0f);
+            dflash.h_final.assign   ((size_t) Lmax * dflash.d, 0.0f);
+            dflash.lm_proj.assign   ((size_t) Lmax * dflash.r_lm, 0.0f);
+            dflash.U_logit.assign   ((size_t) Lmax * dflash.V, 0.0f);
+            dflash.bias_k.assign    ((size_t) Lmax * dflash.V, 0.0f);
+            dflash.confidences.assign((size_t) Lmax, 0.0f);
+            dflash.ctx_proj_out.assign((size_t) dflash.m * dflash.d, 0.0f);
+            dflash.loaded = true;
+            LOG_INF("dflash loaded: d=%d n_layers=%d gamma=%d m=%d V=%d r_lm=%d r_markov=%d\n",
+                    dflash.d, dflash.n_layers, dflash.gamma, dflash.m,
+                    dflash.V, dflash.r_lm, dflash.r_markov);
+            write_header_ok_kv({{"loaded", 1}, {"d", dflash.d},
+                                {"n_layers", dflash.n_layers},
+                                {"gamma", dflash.gamma},
+                                {"m", dflash.m}, {"V", dflash.V}});
+            continue;
+        } else if (op == "dflash_forward") {
+            // Story S32 AC3: run the DFlash transformer forward in C++ and
+            // return logits (L,V) + confidences (L,) + hidden (L,d). The
+            // Python DFlashDrafter.forward() is the reference.
+            if (!dflash.loaded) {
+                write_header_err("dflash not loaded; call dflash_load first");
+                continue;
+            }
+            if (!req.contains("anchor_token") || !req["anchor_token"].is_number_integer()) {
+                write_header_err("dflash_forward requires anchor_token:int");
+                continue;
+            }
+            int anchor_tok = req["anchor_token"].get<int>();
+            if (anchor_tok < 0 || anchor_tok >= dflash.V) {
+                write_header_err("anchor_token out of range [0, V)");
+                continue;
+            }
+            std::vector<int32_t> prev_drafts;
+            int n_prev = 0;
+            if (req.contains("prev_drafts") && req["prev_drafts"].is_array()) {
+                for (const auto & t : req["prev_drafts"]) {
+                    prev_drafts.push_back(t.get<int32_t>());
+                }
+                n_prev = (int) prev_drafts.size();
+            }
+            int L = (n_prev == 0) ? dflash.gamma : (1 + n_prev);
+            if (L > dflash.gamma) {
+                write_header_err("L > gamma: too many prev_drafts");
+                continue;
+            }
+            // h_ctx: m*E float32 — the m-layer context at the anchor.
+            // In --dflash-only mode (or when no prior feed cached it), h_ctx
+            // comes from stdin (the caller sends it explicitly).
+            int n_h_ctx = dflash.m * dflash.E;
+            std::vector<float> h_ctx(n_h_ctx, 0.0f);
+            if (!last_h_ctx.empty() && (int) last_h_ctx.size() == n_h_ctx) {
+                std::copy(last_h_ctx.begin(), last_h_ctx.end(), h_ctx.data());
+            } else if (n_h_ctx > 0 && !read_bytes_into(h_ctx.data(), (size_t) n_h_ctx * sizeof(float))) {
+                write_header_err("dflash_forward: failed to read h_ctx payload");
+                continue;
+            }
+            // Run the forward.
+            dflash_forward(dflash, anchor_tok, h_ctx.data(),
+                           prev_drafts.data(), n_prev, L);
+            // Output: header + logits (L*V float32) + confidences (L float32)
+            // + hidden (L*d float32).
+            write_header_ok_kv({{"L", L}, {"V", dflash.V}, {"d", dflash.d}});
+            write_floats(dflash.U_logit.data(), (size_t) L * dflash.V);
+            write_floats(dflash.confidences.data(), (size_t) L);
+            write_floats(dflash.h_final.data(),  (size_t) L * dflash.d);
             continue;
         } else {
             write_header_err("unknown op: " + op);
