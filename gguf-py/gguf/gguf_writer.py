@@ -90,6 +90,7 @@ class GGUFWriter:
         self.fout = None
         self.path = Path(path) if path else None
         self.arch = arch
+        self.resume_from_shard = int(os.environ.get("GGUF_RESUME_FROM_SHARD", "0") or "0")
         self.endianess = endianess
         self.data_alignment = GGUF_DEFAULT_ALIGNMENT
         self.use_temp_file = use_temp_file
@@ -179,7 +180,13 @@ class GGUFWriter:
 
         if self.path is not None:
             filenames = self.print_plan()
-            self.fout = [open(filename, "wb") for filename in filenames]
+            self.fout = []
+            for idx, filename in enumerate(filenames, start=1):
+                if self.resume_from_shard > 1 and idx < self.resume_from_shard:
+                    logger.info("Preserving existing shard %d/%d during resume: %s", idx, len(filenames), filename)
+                    self.fout.append(open(os.devnull, "wb"))
+                else:
+                    self.fout.append(open(filename, "wb"))
             self.state = WriterState.EMPTY
 
     def print_plan(self) -> list[Path]:
@@ -457,10 +464,20 @@ class GGUFWriter:
                 bar = tqdm(desc="Writing", total=total_bytes, unit="byte", unit_scale=True)
 
             for i, (fout, tensors) in enumerate(zip(self.fout, self.tensors)):
+                shard_index = i + 1
                 if shard_bar is not None:
-                    shard_bar.set_description(f"Shard ({i + 1}/{len(self.fout)})")
+                    shard_bar.set_description(f"Shard ({shard_index}/{len(self.fout)})")
                     total = sum(ti.nbytes for ti in tensors.values())
                     shard_bar.reset(total=(total if total > 0 else None))
+
+                if self.resume_from_shard > 1 and shard_index < self.resume_from_shard:
+                    skipped = sum(ti.nbytes for ti in tensors.values())
+                    logger.info("Skipping preserved shard %d/%d during resume (%s)", shard_index, len(self.fout), GGUFWriter.format_n_bytes_to_str(skipped))
+                    if shard_bar is not None:
+                        shard_bar.update(skipped)
+                    if bar is not None:
+                        bar.update(skipped)
+                    continue
 
                 # relying on the fact that Python dicts preserve insertion order (since 3.7)
                 for ti in tensors.values():

@@ -227,6 +227,17 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
     // ── AC3: end F/S bookkeeping setup ──────────────────────────────────────
 
     for (int il = 0; il < n_layer; ++il) {
+        // Story S31 Option B: expose the residual stream at the input to each
+        // layer so llama_get_embeddings_layer_inp(ctx, lid) returns a valid
+        // pointer when the caller requests per-layer hidden states (DSpark §3.1
+        // KV-injection needs h^t at m target layers). Every sibling arch
+        // (qwen3/qwen3moe/llama/gemma4/deepseek_v3) sets this; glm-dsa missed
+        // it. This is orthogonal to the deferred F/S IndexShare AC3 work —
+        // that gates how the lightning indexer's top_k is shared between full
+        // and shared indexer layers, not whether the input residual is
+        // observable.
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // norm

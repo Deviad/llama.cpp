@@ -570,6 +570,26 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+// Story S25: per-layer prune mask input. A [n_expert] F32 tensor that's
+// -INFINITY at pruned expert indices and 0 elsewhere, added to selection_probs
+// before top-K. The data is filled in set_input() (after backend allocation),
+// not at graph-build time, because Metal lazy-allocates input buffers after
+// the graph is built.
+class llm_graph_input_prune_mask : public llm_graph_input_i {
+public:
+    llm_graph_input_prune_mask(int32_t layer, int64_t n_expert, std::vector<int32_t> pruned_ids)
+        : layer(layer), n_expert(n_expert), pruned_ids(std::move(pruned_ids)) {}
+    virtual ~llm_graph_input_prune_mask() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override { return false; }
+
+    ggml_tensor * mask = nullptr; // F32 [n_expert]
+    const int32_t     layer;
+    const int64_t     n_expert;
+    const std::vector<int32_t> pruned_ids;
+};
+
 //
 // llm_graph_result
 //
@@ -947,6 +967,11 @@ struct llm_graph_context {
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
+
+    // Story S25: build a per-layer prune-mask graph input (F32 [n_expert]).
+    // Returns nullptr if the layer has no pruned experts. The mask is
+    // populated in llm_graph_input_prune_mask::set_input() (post-allocation).
+    ggml_tensor * build_inp_prune_mask(int32_t layer, int64_t n_expert) const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;

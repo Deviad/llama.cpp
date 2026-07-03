@@ -58,6 +58,8 @@ add_library(${TARGET}
     arg.h
     expert-slab-hook.cpp
     expert-slab-hook.h
+    expert-prune.cpp
+    expert-prune.h
     base64.hpp
     chat-auto-parser-generator.cpp
     chat-auto-parser-helpers.cpp

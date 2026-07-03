@@ -2315,6 +2315,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_STREAMING_HOTLIST_OUT"));
     add_opt(common_arg(
+        {"--prune-experts"}, "FILE",
+        "path to a JSON prune list (Story S25). Per-(layer, expert) prune set "
+        "written by the kitchen's derive_glm52_prune_list.py. Selected expert "
+        "logits are masked to -INFINITY before top-K routing in build_moe_ffd, "
+        "so the router never picks a pruned expert. Inference is byte-identical "
+        "without the flag — no re-quantization needed.",
+        [](common_params & params, const std::string & value) {
+            params.prune_experts = value;
+        }
+    ).set_env("LLAMA_ARG_PRUNE_EXPERTS"));
+    add_opt(common_arg(
         {"--trace-prefetch"},
         "log each posix_madvise(WILLNEED) hint issued for routed-expert regions ahead of FFN compute (Story S3). "
         "Prints '<tag> layer=<L> offset=<O> len=<N> addr=<p> rc=<r>' per hint. Use to verify hints lead (not lag) the compute.",

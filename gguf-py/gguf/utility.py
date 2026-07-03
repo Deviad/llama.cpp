@@ -286,6 +286,33 @@ class LocalTensor:
     def mmap_bytes(self) -> np.ndarray:
         return np.memmap(self.data_range.filename, mode='c', offset=self.data_range.offset, shape=self.data_range.size)
 
+    def read_bytes(self) -> np.ndarray:
+        # Positional read() into RAM instead of np.memmap. A page-fault on a
+        # mmap'd file on macOS is delivered as SIGBUS when the underlying vnode
+        # pager cannot satisfy the fault (e.g. a transient USB stall on a
+        # single spinning disk doing simultaneous read+write). read() turns
+        # that into a retryable, bounded-size syscall that never faults.
+        buf = bytearray()
+        path = self.data_range.filename if isinstance(self.data_range.filename, str) else str(self.data_range.filename)
+        remaining = self.data_range.size
+        with open(path, "rb") as f:
+            f.seek(self.data_range.offset)
+            while remaining > 0:
+                chunk = f.read(min(remaining, 64 * 1024 * 1024))
+                if not chunk:
+                    raise IOError(f"short read on {path}: wanted {self.data_range.size} bytes at offset {self.data_range.offset}, got {self.data_range.size - remaining}")
+                buf.extend(chunk)
+                remaining -= len(chunk)
+        return np.frombuffer(bytes(buf), dtype=np.uint8)
+
+    def bytes(self) -> np.ndarray:
+        # Env-gated: set GGUF_NO_MMAP=1 to force read() over mmap. Useful when
+        # source and dest share one spinning USB HDD and mmap page-faults
+        # abort the converter with SIGBUS (exit 138).
+        if os.environ.get("GGUF_NO_MMAP", "") == "1":
+            return self.read_bytes()
+        return self.mmap_bytes()
+
 
 class SafetensorsLocal:
     """

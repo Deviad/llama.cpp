@@ -259,7 +259,7 @@ class ModelBase:
                             data_gen = lambda data=data: LazyTorchTensor.from_local_tensor(data)  # noqa: E731
                         else:
                             dtype = LazyTorchTensor._dtype_str_map[data.dtype]
-                            data_gen = lambda data=data, dtype=dtype: torch.from_numpy(data.mmap_bytes()).view(dtype).reshape(data.shape)  # noqa: E731
+                            data_gen = lambda data=data, dtype=dtype: torch.from_numpy(data.bytes()).view(dtype).reshape(data.shape)  # noqa: E731
                     else:
                         data_torch: Tensor = model_part[name]
                         if self.lazy:
@@ -2560,7 +2560,7 @@ class LazyTorchTensor(gguf.LazyBase):
                 return tensor
             dtype = cls._dtype_str_map[tensor.dtype]
             numpy_dtype = cls._dtype_byteswap_map[dtype]
-            return torch.from_numpy(byteswap_tensor(tensor.mmap_bytes(), numpy_dtype)).view(dtype).reshape(tensor.shape)
+            return torch.from_numpy(byteswap_tensor(tensor.bytes(), numpy_dtype)).view(dtype).reshape(tensor.shape)
         dtype = cls._dtype_str_map[t.dtype]
         shape = t.shape
         lazy = cls(meta=cls.meta_with_dtype_and_shape(dtype, shape), args=(t,), func=lambda r: load_tensor(r))

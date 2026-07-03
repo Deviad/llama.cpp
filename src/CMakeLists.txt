@@ -50,6 +50,7 @@ set_target_properties(llama PROPERTIES
 )
 
 target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE ../common)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
@@ -59,4 +60,12 @@ if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
+    # Story S25 (per-expert pruning): llama-graph.cpp calls expert_prune_*()
+    # which lives in llama-common (common/expert-prune.cpp). Because src/
+    # is traversed before common/ in the root CMakeLists and llama-common
+    # already links llama, we cannot add a forwards circular link dep here.
+    # Instead let these references resolve at load time from libllama-common
+    # (every binary that links llama also links llama-common, so the symbols
+    # are guaranteed present at runtime).
+    target_link_options(llama PRIVATE -undefined dynamic_lookup)
 endif()

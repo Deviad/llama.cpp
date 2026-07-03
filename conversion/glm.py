@@ -214,6 +214,14 @@ class GlmMoeDsaModel(DeepseekV2Model):
     model_arch = gguf.MODEL_ARCH.GLM_DSA
     skip_mtp = False
 
+    _INDEXER_SUFFIXES = (
+        "k_norm.bias",
+        "k_norm.weight",
+        "weights_proj.weight",
+        "wk.weight",
+        "wq_b.weight",
+    )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
@@ -221,6 +229,57 @@ class GlmMoeDsaModel(DeepseekV2Model):
 
     def set_vocab(self):
         return self._set_vocab_glm()
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        """Materialize GLM-DSA shared IndexShare tensors.
+
+        Upstream GLM-5.2 HF checkpoints store the 21 "full" layer indexers
+        plus MTP, while config.json carries indexer_types[] = 21 full / 57
+        shared. llama.cpp's glm-dsa runtime currently expects per-layer
+        materialized indexer tensors (the known-good prebuilt GGUFs have this
+        shape), so emit shared-layer copies from the nearest preceding full
+        layer before the normal tensor pass maps HF names to GGUF names.
+        """
+        yield from super().generate_extra_tensors()
+
+        indexer_types = self.hparams.get("indexer_types")
+        if not indexer_types:
+            return
+
+        if len(indexer_types) != self.hparams["num_hidden_layers"]:
+            raise ValueError(
+                f"GLM-DSA indexer_types length {len(indexer_types)} does not match "
+                f"num_hidden_layers {self.hparams['num_hidden_layers']}"
+            )
+
+        last_full_layer: int | None = None
+        for layer, indexer_type in enumerate(indexer_types):
+            if indexer_type == "full":
+                last_full_layer = layer
+                continue
+
+            if indexer_type != "shared":
+                raise ValueError(f"Unsupported GLM-DSA indexer_types[{layer}]={indexer_type!r}")
+
+            if last_full_layer is None:
+                raise ValueError(f"GLM-DSA shared indexer layer {layer} has no preceding full layer")
+
+            for suffix in self._INDEXER_SUFFIXES:
+                source_name = f"model.layers.{last_full_layer}.self_attn.indexer.{suffix}"
+                target_name = f"model.layers.{layer}.self_attn.indexer.{suffix}"
+                if target_name in self.model_tensors:
+                    continue
+                if source_name not in self.model_tensors:
+                    raise ValueError(
+                        f"Missing GLM-DSA full indexer source tensor {source_name!r} "
+                        f"needed to materialize shared layer {layer}"
+                    )
+                logger.info(
+                    "Materializing GLM-DSA shared indexer tensor %s from %s",
+                    target_name,
+                    source_name,
+                )
+                yield target_name, self.model_tensors[source_name]()
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()

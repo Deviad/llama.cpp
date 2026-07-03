@@ -4,6 +4,7 @@
 #include "console.h"
 #include "fit.h"
 #include "expert-slab-hook.h" // Story S4: routed-expert SSD streaming hook
+#include "expert-prune.h"        // Story S25: per-expert router-logit mask
 // #include "log.h"
 
 #include "server-common.h"
@@ -422,6 +423,20 @@ int llama_cli(int argc, char ** argv) {
         if (!llama_expert_slab_hook_install(params, slab_hook, hook_err)) {
             console::spinner::stop();
             console::error("\nFailed to install expert-slab hook: %s\n", hook_err.c_str());
+            return 1;
+        }
+    }
+
+    // Story S25: load per-expert prune list (router-logit mask). Default-off.
+    // Must happen BEFORE load_model()/context creation: llama.cpp may reserve or
+    // warm up graph topology there. If prune state is empty at that point, the
+    // graph is built without the prune-mask input/add node and later loading the
+    // list is a generation-path no-op (score_official already loaded before ctx).
+    if (!params.prune_experts.empty()) {
+        std::string perr;
+        if (!expert_prune_load(params.prune_experts, perr)) {
+            console::spinner::stop();
+            console::error("\nFailed to load --prune-experts: %s\n", perr.c_str());
             return 1;
         }
     }

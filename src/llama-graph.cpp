@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "expert-prune.h" // Story S25: per-expert router-logit mask
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -167,6 +169,23 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     res &= pos->ne[0] == params.ubatch.n_tokens*n_pos_per_embd;
 
     return res;
+}
+
+// Story S25: populate the prune mask after backend allocation.
+// At graph-build time mask->data is NULL (lazy-allocated), so the actual
+// host->backend copy must happen here, in set_input(), which runs after the
+// scheduler has allocated input buffers.
+void llm_graph_input_prune_mask::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (!mask) return;
+    // Build the host buffer: 0 for kept experts, -INFINITY for pruned.
+    std::vector<float> data(n_expert, 0.0f);
+    for (int32_t e : pruned_ids) {
+        if (e >= 0 && e < (int32_t) n_expert) {
+            data[e] = -std::numeric_limits<float>::infinity();
+        }
+    }
+    ggml_backend_tensor_set(mask, data.data(), 0, n_expert * sizeof(float));
 }
 
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
@@ -1599,6 +1618,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // select experts
+    // Story S25: apply per-expert prune mask (if loaded) just before top-K,
+    // so masked experts (selection_probs = -INF) are never selected.
+    // No-op when no prune list is loaded — inference stays byte-identical.
+    // The mask is built as a graph input (build_inp_prune_mask) so its data
+    // is populated in set_input() after backend allocation (host writes at
+    // build time don't reach the Metal backend — see expert-prune.h).
+    ggml_tensor * prune_mask = build_inp_prune_mask(il, n_expert);
+    if (prune_mask) {
+        // prune_mask is [n_expert]; selection_probs is [n_expert, n_tokens].
+        // ggml_add broadcasts the 1D mask across n_tokens.
+        selection_probs = ggml_add(ctx0, selection_probs, prune_mask);
+        cb(selection_probs, "ffn_moe_probs_pruned", il);
+    }
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
@@ -1941,6 +1973,26 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     cur = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_tokens);
     ggml_set_input(cur);
     ggml_set_name(cur, "attn_scale");
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
+// Story S25: build a per-layer prune-mask input tensor (F32 [n_expert]).
+// Returns nullptr if no prune state is loaded or the layer has no pruned IDs.
+// The mask's data is populated in llm_graph_input_prune_mask::set_input(),
+// which runs after the backend allocates the input buffer.
+ggml_tensor * llm_graph_context::build_inp_prune_mask(int32_t layer, int64_t n_expert) const {
+    if (expert_prune_empty()) return nullptr;
+    auto pruned_ids = expert_prune_layer_ids(layer);
+    if (pruned_ids.empty()) return nullptr;
+
+    auto inp = std::make_unique<llm_graph_input_prune_mask>(layer, n_expert, std::move(pruned_ids));
+
+    auto & cur = inp->mask;
+    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_expert);
+    ggml_set_input(cur);
 
     res->add_input(std::move(inp));
 
