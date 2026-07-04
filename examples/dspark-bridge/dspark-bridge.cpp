@@ -705,10 +705,16 @@ int main(int argc, char ** argv) {
 
     llama_model * model = nullptr;
     llama_context * ctx  = nullptr;
+    // NOTE: `init` MUST be declared at main() scope (not inside the if-block)
+    // because it's a unique_ptr<common_init_result> whose destructor frees
+    // the model + context. If declared inside the {} scope, it would be
+    // destroyed at the closing brace, leaving `model`/`ctx` dangling and
+    // every subsequent call (vocab fetch, n_batch, decode) would segfault.
+    common_init_result_ptr init;
     if (!ba.dflash_only) {
         LOG_INF("loading model: %s (ngl=%d, n_ctx=%d, embedding=%d)\n",
                 ba.model_path.c_str(), ba.ngl, ba.n_ctx, ba.embedding ? 1 : 0);
-        auto init = common_init_from_params(params);
+        init = common_init_from_params(params);
         model = init->model();
         ctx  = init->context();
         if (!model || !ctx) {
