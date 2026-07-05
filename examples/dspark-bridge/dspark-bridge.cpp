@@ -1937,18 +1937,23 @@ int main(int argc, char ** argv) {
             write_floats(dflash.confidences.data(), (size_t) L);
             write_floats(dflash.h_final.data(),  (size_t) L * dflash.d);
             continue;
-        } else if (op == "dspark_cycle_dflash") {
-            // Story S32 AC4: the fused DFlash cycle. Runs γ iterative
-            // dflash_forward calls (the draft() method: k=0 uses L=1, k>=1
-            // uses L=k+1 with teacher-forced prefix), then reuses the target
-            // feed + Leviathan rejection + KV rollback from dspark_cycle — all
-            // in C++, no Python, no binary p_d pipe.
+        } else if (op == "dspark_cycle_dflash" || op == "dspark_cycle_dflash_greedy") {
+            const bool greedy_verify = (op == "dspark_cycle_dflash_greedy");
+            // Story S32 AC4 / Story 7.P: the fused DFlash cycle. Runs γ cached
+            // incremental DFlash steps, then reuses the target feed + verifier
+            // + KV rollback from dspark_cycle — all in C++, no Python, no
+            // binary p_d pipe. `dspark_cycle_dflash` is distribution-correct
+            // Leviathan sampling; `dspark_cycle_dflash_greedy` is deterministic
+            // batched-target greedy verification. NOTE: on this quant/model,
+            // llama.cpp batched prefill logits are not token-identical to
+            // single-token next_greedy decode, so this op must NOT be described
+            // as exact direct-D5 greedy output.
             if (!dflash.loaded) {
                 write_header_err("dflash not loaded; call dflash_load first");
                 continue;
             }
             if (!req.contains("anchor_token") || !req["anchor_token"].is_number_integer()) {
-                write_header_err("dspark_cycle_dflash requires anchor_token:int");
+                write_header_err(op + " requires anchor_token:int");
                 continue;
             }
             int anchor_tok = req["anchor_token"].get<int>();
@@ -1966,10 +1971,10 @@ int main(int argc, char ** argv) {
                 // payload before expecting the graceful target-model error.
                 // Drain it so the JSON stream stays aligned.
                 if (n_h_ctx > 0 && !read_bytes_into(h_ctx.data(), (size_t) n_h_ctx * sizeof(float))) {
-                    write_header_err("dspark_cycle_dflash: failed to read h_ctx payload");
+                    write_header_err(op + ": failed to read h_ctx payload");
                     continue;
                 }
-                write_header_err("dspark_cycle_dflash requires the target model (not --dflash-only)");
+                write_header_err(op + " requires the target model (not --dflash-only)");
                 continue;
             }
             // Optional seed override.
@@ -1978,7 +1983,6 @@ int main(int argc, char ** argv) {
             }
             const int g  = dflash.gamma;
             const int Vd = dflash.V;
-            const int d_df = dflash.d;
 
             // --- 0. Feed anchor → p_t[0] + h_ctx (NO duplication). ---
             // The anchor is NOT yet in KV. Feed it (1-token decode) to get:
@@ -1999,7 +2003,7 @@ int main(int argc, char ** argv) {
                 if (llama_decode(ctx, ab) != 0) {
                     LOG_ERR("dspark_cycle_dflash: anchor feed failed\n");
                     llama_batch_free(ab);
-                    write_header_err("dspark_cycle_dflash anchor feed failed");
+                    write_header_err(op + " anchor feed failed");
                     continue;
                 }
                 // p_t[0] = logits at the anchor (predicts draft[0]).
@@ -2100,39 +2104,67 @@ int main(int argc, char ** argv) {
                 (void) softmax_inplace(p_t.data() + (size_t) k * Vd, Vd);
             }
 
-            // --- 3. Leviathan rejection sampler. ---
+            // --- 3. Verifier. ---
             std::vector<int32_t> accepted_tokens;
             accepted_tokens.reserve(g + 1);
             int n_accepted = 0;
             int reject_position = -1;
-            for (int k = 0; k < g; k++) {
-                int x_k = draft_tokens[k];
-                const float * q = dflash.p_d.data() + (size_t) k * Vd;
-                const float * p = p_t.data() + (size_t) k * Vd;
-                float q_x = q[x_k];
-                float p_x = p[x_k];
-                float ratio = (q_x <= 0.0f) ? 1.0f : std::min(1.0f, p_x / q_x);
-                float r = rng_uniform(dflash.rng_state);
-                if (r < ratio) {
-                    accepted_tokens.push_back((int32_t) x_k);
-                    n_accepted += 1;
-                    continue;
-                }
-                std::vector<float> resample_scratch((size_t) Vd);
-                for (int v = 0; v < Vd; v++) {
-                    float diff = p[v] - q[v];
-                    resample_scratch[v] = diff > 0.0f ? diff : 0.0f;
-                }
-                int x_star = sample_from_dist(resample_scratch.data(), Vd, dflash.rng_state);
-                accepted_tokens.push_back((int32_t) x_star);
-                reject_position = k;
-                break;
-            }
             int bonus_token = -1;
-            if (reject_position < 0) {
-                const float * p_bonus = p_t.data() + (size_t) g * Vd;
-                bonus_token = sample_from_dist(p_bonus, Vd, dflash.rng_state);
-                accepted_tokens.push_back((int32_t) bonus_token);
+            if (greedy_verify) {
+                // Deterministic batched-greedy verifier: accept while draft ==
+                // argmax of the batched target verifier row. On mismatch, commit
+                // the batched verifier's argmax as the replacement token. This
+                // is deterministic, but not guaranteed token-identical to
+                // single-token direct D5 decode because prefill-vs-decode
+                // numerical paths can choose different argmax tokens.
+                for (int k = 0; k < g; k++) {
+                    int x_k = draft_tokens[k];
+                    const float * p = p_t.data() + (size_t) k * Vd;
+                    int d5_argmax = argmax(p, Vd);
+                    if (x_k == d5_argmax) {
+                        accepted_tokens.push_back((int32_t) x_k);
+                        n_accepted += 1;
+                        continue;
+                    }
+                    accepted_tokens.push_back((int32_t) d5_argmax);
+                    reject_position = k;
+                    break;
+                }
+                if (reject_position < 0) {
+                    const float * p_bonus = p_t.data() + (size_t) g * Vd;
+                    bonus_token = argmax(p_bonus, Vd);
+                    accepted_tokens.push_back((int32_t) bonus_token);
+                }
+            } else {
+                // Distribution-correct Leviathan-2023 verifier.
+                for (int k = 0; k < g; k++) {
+                    int x_k = draft_tokens[k];
+                    const float * q = dflash.p_d.data() + (size_t) k * Vd;
+                    const float * p = p_t.data() + (size_t) k * Vd;
+                    float q_x = q[x_k];
+                    float p_x = p[x_k];
+                    float ratio = (q_x <= 0.0f) ? 1.0f : std::min(1.0f, p_x / q_x);
+                    float r = rng_uniform(dflash.rng_state);
+                    if (r < ratio) {
+                        accepted_tokens.push_back((int32_t) x_k);
+                        n_accepted += 1;
+                        continue;
+                    }
+                    std::vector<float> resample_scratch((size_t) Vd);
+                    for (int v = 0; v < Vd; v++) {
+                        float diff = p[v] - q[v];
+                        resample_scratch[v] = diff > 0.0f ? diff : 0.0f;
+                    }
+                    int x_star = sample_from_dist(resample_scratch.data(), Vd, dflash.rng_state);
+                    accepted_tokens.push_back((int32_t) x_star);
+                    reject_position = k;
+                    break;
+                }
+                if (reject_position < 0) {
+                    const float * p_bonus = p_t.data() + (size_t) g * Vd;
+                    bonus_token = sample_from_dist(p_bonus, Vd, dflash.rng_state);
+                    accepted_tokens.push_back((int32_t) bonus_token);
+                }
             }
 
             // --- 4. KV-cache rollback (n_start-based, no h_ctx extraction). ---
