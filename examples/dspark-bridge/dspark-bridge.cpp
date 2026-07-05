@@ -451,6 +451,14 @@ struct DFlashState {
     std::vector<float> U_logit;            // (L, V)
     std::vector<float> bias_k;             // (L, V)  Markov bias
     std::vector<float> confidences;        // (L,)
+    // Cached incremental drafting path for dspark_cycle_dflash.
+    // Context K/V: (n_layers, m, d). Draft K/V: (n_layers, gamma, d).
+    // This turns γ iterative draft() calls from O(1+...+γ) full-prefix
+    // transformer passes into O(γ) single-position steps.
+    std::vector<float> cache_ctx_k;
+    std::vector<float> cache_ctx_v;
+    std::vector<float> cache_k;
+    std::vector<float> cache_v;
     // Story S32 AC4: cycle state.
     uint64_t rng_state = 0x9E3779B97F4A7C15ULL;  // LCG for Leviathan rejection
     std::vector<float> p_d;               // (gamma, V) draft distributions
@@ -681,6 +689,164 @@ static void dflash_forward(DFlashState & df, int anchor_tok,
         for (int j = 0; j < rmk; j++) cl += df.w_conf[d + j] * emb_prev[j];
         df.confidences[k] = sigmoidf(cl);
     }
+}
+
+// Cached incremental DFlash path used by dspark_cycle_dflash.
+// This preserves the full dflash_forward() reference path above while avoiding
+// the O(γ²) reprocessing pattern in the fused cycle. For a cycle, call
+// dflash_cache_begin(df, h_ctx), then call dflash_forward_cached_step() for
+// pos=0..γ-1 with prev_tok=(pos==0 ? anchor : draft[pos-1]).
+static void dflash_cache_begin(DFlashState & df, const float * h_ctx) {
+    const int d = df.d, m = df.m;
+
+    // Same target-context projection as full dflash_forward().
+    df.ctx_proj_out.assign((size_t) m * d, 0.0f);
+    gemm_lin(h_ctx, df.ctx_W_c, df.ctx_proj_out.data(), 1, df.ctx_dim, m * d);
+    rmsnorm(df.ctx_proj_out.data(), df.ctx_norm, df.ctx_proj_out.data(), m, d);
+
+    // Reset draft K/V cache for safety. Context K/V is overwritten below.
+    std::fill(df.cache_k.begin(), df.cache_k.end(), 0.0f);
+    std::fill(df.cache_v.begin(), df.cache_v.end(), 0.0f);
+
+    // Precompute context K/V per transformer block. The DFlash architecture
+    // uses fixed projected ctx tokens concatenated to every block's draft
+    // sequence; ctx is not transformed across layers.
+    for (int il = 0; il < df.n_layers; il++) {
+        const auto & blk = df.blocks[il];
+        gemm_lin(df.ctx_proj_out.data(), blk.qkv, df.qkv_out.data(), m, d, 3 * d);
+        float * ctx_k_layer = df.cache_ctx_k.data() + (size_t) il * m * d;
+        float * ctx_v_layer = df.cache_ctx_v.data() + (size_t) il * m * d;
+        for (int i = 0; i < m; i++) {
+            const float * row = df.qkv_out.data() + (size_t) i * 3 * d;
+            float * k_dst = ctx_k_layer + (size_t) i * d;
+            float * v_dst = ctx_v_layer + (size_t) i * d;
+            for (int e = 0; e < d; e++) {
+                k_dst[e] = row[d + e];
+                v_dst[e] = row[2 * d + e];
+            }
+        }
+    }
+}
+
+static void dflash_forward_cached_step(DFlashState & df, int prev_tok, int pos) {
+    const int d = df.d, m = df.m, V = df.V;
+    const int H = df.n_heads, hd = df.head_dim;
+    const int rlm = df.r_lm, rmk = df.r_markov;
+    const int gamma = df.gamma;
+    const int w = df.sliding_window;
+
+    // Token + absolute draft-position embedding for this single step.
+    const float * emb = df.tok_emb + (size_t) prev_tok * d;
+    const float * pos_emb = df.pos_emb + (size_t) pos * d;
+    float * x = df.x_draft.data();
+    for (int i = 0; i < d; i++) x[i] = emb[i] + pos_emb[i];
+
+    for (int il = 0; il < df.n_layers; il++) {
+        const auto & blk = df.blocks[il];
+
+        // Pre-norm current token, project QKV for this draft position.
+        rmsnorm(df.x_draft.data(), blk.norm1, df.norm_out.data(), 1, d);
+        gemm_lin(df.norm_out.data(), blk.qkv, df.qkv_out.data(), 1, d, 3 * d);
+
+        const float * qkv = df.qkv_out.data();
+        float * k_cache = df.cache_k.data() + ((size_t) il * gamma + (size_t) pos) * d;
+        float * v_cache = df.cache_v.data() + ((size_t) il * gamma + (size_t) pos) * d;
+        for (int e = 0; e < d; e++) {
+            k_cache[e] = qkv[d + e];
+            v_cache[e] = qkv[2 * d + e];
+        }
+
+        const float * ctx_k_layer = df.cache_ctx_k.data() + (size_t) il * m * d;
+        const float * ctx_v_layer = df.cache_ctx_v.data() + (size_t) il * m * d;
+        const float * draft_k_layer = df.cache_k.data() + (size_t) il * gamma * d;
+        const float * draft_v_layer = df.cache_v.data() + (size_t) il * gamma * d;
+
+        // Attention for the current query only. Match full forward's key order:
+        // all ctx keys first, then draft keys in causal/sliding-window order.
+        float * attn = df.attn_out.data();
+        for (int e = 0; e < d; e++) attn[e] = 0.0f;
+        int first_draft = std::max(0, pos - w + 1);
+        const int n_keys = m + (pos - first_draft + 1);
+        float * scores = df.scores.data();
+
+        for (int h = 0; h < H; h++) {
+            const float * qi = qkv + (size_t) h * hd;
+            float mx = -1e30f;
+            int sk = 0;
+            for (int j = 0; j < m; j++, sk++) {
+                const float * kj = ctx_k_layer + (size_t) j * d + (size_t) h * hd;
+                float s = 0.0f;
+                for (int e = 0; e < hd; e++) s += qi[e] * kj[e];
+                s /= sqrtf((float) hd);
+                scores[sk] = s;
+                if (s > mx) mx = s;
+            }
+            for (int j = first_draft; j <= pos; j++, sk++) {
+                const float * kj = draft_k_layer + (size_t) j * d + (size_t) h * hd;
+                float s = 0.0f;
+                for (int e = 0; e < hd; e++) s += qi[e] * kj[e];
+                s /= sqrtf((float) hd);
+                scores[sk] = s;
+                if (s > mx) mx = s;
+            }
+
+            float sum = 0.0f;
+            for (int j = 0; j < n_keys; j++) {
+                scores[j] = expf(scores[j] - mx);
+                sum += scores[j];
+            }
+            float inv = 1.0f / sum;
+            float * out_h = attn + (size_t) h * hd;
+            for (int e = 0; e < hd; e++) out_h[e] = 0.0f;
+            sk = 0;
+            for (int j = 0; j < m; j++, sk++) {
+                float ww = scores[sk] * inv;
+                const float * vj = ctx_v_layer + (size_t) j * d + (size_t) h * hd;
+                for (int e = 0; e < hd; e++) out_h[e] += ww * vj[e];
+            }
+            for (int j = first_draft; j <= pos; j++, sk++) {
+                float ww = scores[sk] * inv;
+                const float * vj = draft_v_layer + (size_t) j * d + (size_t) h * hd;
+                for (int e = 0; e < hd; e++) out_h[e] += ww * vj[e];
+            }
+        }
+
+        // Output projection + residual. Reuse ffn_out as a one-row projection scratch.
+        gemm_lin(df.attn_out.data(), blk.o, df.ffn_out.data(), 1, d, d);
+        for (int i = 0; i < d; i++) df.x_draft[i] += df.ffn_out[i];
+
+        // FFN block.
+        rmsnorm(df.x_draft.data(), blk.norm2, df.norm_out.data(), 1, d);
+        gemm_lin(df.norm_out.data(), blk.ffn_gate, df.ffn_g.data(), 1, d, df.ffn_hidden);
+        gemm_lin(df.norm_out.data(), blk.ffn_up,   df.ffn_u.data(), 1, d, df.ffn_hidden);
+        for (int i = 0; i < df.ffn_hidden; i++) {
+            float g = df.ffn_g[i];
+            float silu = g / (1.0f + expf(-g));
+            df.ffn_g[i] = silu * df.ffn_u[i];
+        }
+        gemm_lin(df.ffn_g.data(), blk.ffn_down, df.ffn_out.data(), 1, df.ffn_hidden, d);
+        for (int i = 0; i < d; i++) df.x_draft[i] += df.ffn_out[i];
+    }
+
+    // Final norm + heads for this position only. Write into row `pos` so the
+    // caller can keep using df.U_logit[pos] / df.confidences[pos].
+    float * h_row = df.h_final.data() + (size_t) pos * d;
+    rmsnorm(df.x_draft.data(), df.final_norm, h_row, 1, d);
+
+    float * lm_row = df.lm_proj.data() + (size_t) pos * rlm;
+    float * U_row  = df.U_logit.data() + (size_t) pos * V;
+    gemm_lin(h_row, df.lm_A, lm_row, 1, d, rlm);
+    gemm_lin(lm_row, df.lm_B, U_row, 1, rlm, V);
+
+    const float * emb_prev = df.W1m + (size_t) prev_tok * rmk;
+    float * bias = df.bias_k.data() + (size_t) pos * V;
+    gemm_lin(emb_prev, df.W2m, bias, 1, rmk, V);
+    for (int v = 0; v < V; v++) U_row[v] += bias[v];
+
+    float cl = 0.0f;
+    for (int i = 0; i < d; i++) cl += df.w_conf[i] * h_row[i];
+    for (int j = 0; j < rmk; j++) cl += df.w_conf[d + j] * emb_prev[j];
+    df.confidences[pos] = sigmoidf(cl);
 }
 
 int main(int argc, char ** argv) {
@@ -1707,6 +1873,10 @@ int main(int argc, char ** argv) {
             dflash.bias_k.assign    ((size_t) Lmax * dflash.V, 0.0f);
             dflash.confidences.assign((size_t) Lmax, 0.0f);
             dflash.ctx_proj_out.assign((size_t) dflash.m * dflash.d, 0.0f);
+            dflash.cache_ctx_k.assign((size_t) dflash.n_layers * dflash.m * dflash.d, 0.0f);
+            dflash.cache_ctx_v.assign((size_t) dflash.n_layers * dflash.m * dflash.d, 0.0f);
+            dflash.cache_k.assign    ((size_t) dflash.n_layers * Lmax * dflash.d, 0.0f);
+            dflash.cache_v.assign    ((size_t) dflash.n_layers * Lmax * dflash.d, 0.0f);
             dflash.loaded = true;
             LOG_INF("dflash loaded: d=%d n_layers=%d gamma=%d m=%d V=%d r_lm=%d r_markov=%d\n",
                     dflash.d, dflash.n_layers, dflash.gamma, dflash.m,
@@ -1792,6 +1962,13 @@ int main(int argc, char ** argv) {
             const int n_h_ctx = dflash.m * dflash.E;
             std::vector<float> h_ctx(n_h_ctx, 0.0f);
             if (ba.dflash_only) {
+                // Protocol compatibility: older tests/callers send an h_ctx
+                // payload before expecting the graceful target-model error.
+                // Drain it so the JSON stream stays aligned.
+                if (n_h_ctx > 0 && !read_bytes_into(h_ctx.data(), (size_t) n_h_ctx * sizeof(float))) {
+                    write_header_err("dspark_cycle_dflash: failed to read h_ctx payload");
+                    continue;
+                }
                 write_header_err("dspark_cycle_dflash requires the target model (not --dflash-only)");
                 continue;
             }
@@ -1851,24 +2028,24 @@ int main(int argc, char ** argv) {
                 n_past += 1;
             }
 
-            // --- 1. γ iterative dflash_forward calls (draft() method). ---
-            // k=0: L=1, prev_drafts=nullptr → position 0
-            // k>=1: L=k+1, prev_drafts=draft_tokens[0..k-1] → position L-1=k
+            // --- 1. γ cached single-position DFlash steps (draft() method). ---
+            // Full-prefix dflash_forward did 1+...+γ position-forwards per
+            // cycle. The cached path precomputes context K/V and then appends
+            // one draft position at a time, matching causal transformer
+            // semantics while reducing drafter work to γ position-forwards.
+            dflash_cache_begin(dflash, h_ctx.data());
             dflash.p_d.assign((size_t) g * Vd, 0.0f);
             std::vector<int32_t> draft_tokens(g);
             std::vector<float>   confidences(g);
             for (int k = 0; k < g; k++) {
-                int n_prev_k = k;
-                int L_k = (k == 0) ? 1 : (k + 1);
-                const int32_t * prev_k = (k == 0) ? nullptr : draft_tokens.data();
-                dflash_forward(dflash, anchor_tok, h_ctx.data(), prev_k, n_prev_k, L_k);
-                int pos_k = (k == 0) ? 0 : (L_k - 1);
-                const float * logits_k = dflash.U_logit.data() + (size_t) pos_k * Vd;
+                int prev_tok = (k == 0) ? anchor_tok : (int) draft_tokens[k - 1];
+                dflash_forward_cached_step(dflash, prev_tok, k);
+                const float * logits_k = dflash.U_logit.data() + (size_t) k * Vd;
                 float * p_d_k = dflash.p_d.data() + (size_t) k * Vd;
                 for (int v = 0; v < Vd; v++) p_d_k[v] = logits_k[v];
                 (void) softmax_inplace(p_d_k, Vd);
                 draft_tokens[k] = (int32_t) argmax(p_d_k, Vd);
-                confidences[k] = dflash.confidences[pos_k];
+                confidences[k] = dflash.confidences[k];
             }
 
             // --- 2. Target feed [*draft_tokens] (γ tokens, NO anchor). ---
