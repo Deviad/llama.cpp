@@ -1786,16 +1786,11 @@ int main(int argc, char ** argv) {
                 write_header_err("anchor_token out of range [0, V)");
                 continue;
             }
-            // h_ctx from last_h_ctx cache or stdin. MUST drain stdin before
-            // any rejection so the protocol stays clean.
+            // h_ctx is extracted fresh in step 0 (anchor feed). No stdin read,
+            // no dependency on last_h_ctx — eliminates the off-by-one bug AND
+            // the anchor-duplication accumulation that crippled cycles 2+.
             const int n_h_ctx = dflash.m * dflash.E;
             std::vector<float> h_ctx(n_h_ctx, 0.0f);
-            if (!last_h_ctx.empty() && (int) last_h_ctx.size() == n_h_ctx) {
-                std::copy(last_h_ctx.begin(), last_h_ctx.end(), h_ctx.data());
-            } else if (n_h_ctx > 0 && !read_bytes_into(h_ctx.data(), (size_t) n_h_ctx * sizeof(float))) {
-                write_header_err("dspark_cycle_dflash: failed to read h_ctx payload");
-                continue;
-            }
             if (ba.dflash_only) {
                 write_header_err("dspark_cycle_dflash requires the target model (not --dflash-only)");
                 continue;
@@ -1808,7 +1803,55 @@ int main(int argc, char ** argv) {
             const int Vd = dflash.V;
             const int d_df = dflash.d;
 
-            // --- 1. γ iterative dflash_forward calls (the draft() method). ---
+            // --- 0. Feed anchor → p_t[0] + h_ctx (NO duplication). ---
+            // The anchor is NOT yet in KV. Feed it (1-token decode) to get:
+            //   (a) p_t[0] = D5's prediction for draft[0] (logits at anchor)
+            //   (b) h_ctx  = m-layer context at the anchor (for the drafter)
+            // This replaces the old [anchor, *drafts] feed which duplicated
+            // the anchor every cycle, corrupting D5's KV over long generation.
+            llama_pos n_start = n_past;
+            std::vector<float> p_t((size_t) (g + 1) * Vd, 0.0f);
+            {
+                llama_batch ab = llama_batch_init(1, 0, 1);
+                ab.token[0]     = (llama_token) anchor_tok;
+                ab.pos[0]       = n_past;
+                ab.n_seq_id[0]  = 1;
+                ab.seq_id[0][0] = seq_id;
+                ab.logits[0]    = 1;
+                ab.n_tokens     = 1;
+                if (llama_decode(ctx, ab) != 0) {
+                    LOG_ERR("dspark_cycle_dflash: anchor feed failed\n");
+                    llama_batch_free(ab);
+                    write_header_err("dspark_cycle_dflash anchor feed failed");
+                    continue;
+                }
+                // p_t[0] = logits at the anchor (predicts draft[0]).
+                const float * lg0 = llama_get_logits_ith(ctx, 0);
+                if (lg0) { float * d0 = p_t.data(); for (int v = 0; v < Vd; v++) d0[v] = lg0[v]; }
+                // h_ctx from layer_inp at batch index 0.
+                if (ba.embedding) {
+                    const float * em = llama_get_embeddings_ith(ctx, 0);
+                    if (em) last_hidden.assign(em, em + n_embd);
+                }
+                if (n_extract > 0) {
+                    std::vector<float> h_ctx_new;
+                    h_ctx_new.reserve((size_t) n_extract * n_embd);
+                    for (int32_t ei = 0; ei < n_extract; ei++) {
+                        int32_t lid = ba.extract_layers[ei];
+                        const float * layer = (const float *) llama_get_embeddings_layer_inp(ctx, (uint32_t) lid);
+                        if (!layer) { LOG_ERR("dspark_cycle_dflash: layer_inp(lid=%d) null\n", lid); break; }
+                        h_ctx_new.insert(h_ctx_new.end(), layer, layer + n_embd);
+                    }
+                    if ((int) h_ctx_new.size() == n_h_ctx) {
+                        last_h_ctx = h_ctx_new;
+                        std::copy(h_ctx_new.begin(), h_ctx_new.end(), h_ctx.data());
+                    }
+                }
+                llama_batch_free(ab);
+                n_past += 1;
+            }
+
+            // --- 1. γ iterative dflash_forward calls (draft() method). ---
             // k=0: L=1, prev_drafts=nullptr → position 0
             // k>=1: L=k+1, prev_drafts=draft_tokens[0..k-1] → position L-1=k
             dflash.p_d.assign((size_t) g * Vd, 0.0f);
@@ -1822,61 +1865,65 @@ int main(int argc, char ** argv) {
                 int pos_k = (k == 0) ? 0 : (L_k - 1);
                 const float * logits_k = dflash.U_logit.data() + (size_t) pos_k * Vd;
                 float * p_d_k = dflash.p_d.data() + (size_t) k * Vd;
-                // Copy logits → p_d, then softmax in place.
                 for (int v = 0; v < Vd; v++) p_d_k[v] = logits_k[v];
                 (void) softmax_inplace(p_d_k, Vd);
                 draft_tokens[k] = (int32_t) argmax(p_d_k, Vd);
                 confidences[k] = dflash.confidences[pos_k];
             }
 
-            // --- 2. C++ target feed of [anchor, *draft_tokens]. ---
-            std::vector<llama_token> feed_tokens;
-            feed_tokens.push_back((llama_token) anchor_tok);
-            for (int k = 0; k < g; k++) feed_tokens.push_back((llama_token) draft_tokens[k]);
-            int n_feed = (int) feed_tokens.size();   // gamma+1
-            std::vector<float> p_t((size_t) n_feed * Vd, 0.0f);
-            bool feed_ok = true;
-            size_t f_idx = 0;
-            llama_pos n_pre = n_past;
-            while (f_idx < (size_t) n_feed) {
-                size_t chunk = std::min((size_t) n_batch, (size_t) n_feed - f_idx);
-                llama_batch batch = llama_batch_init((int) chunk, 0, 1);
-                for (size_t i = 0; i < chunk; i++) {
-                    batch.token[i]    = feed_tokens[f_idx + i];
-                    batch.pos[i]      = n_past + (llama_pos) i;
-                    batch.n_seq_id[i] = 1;
-                    batch.seq_id[i][0] = seq_id;
-                    batch.logits[i]   = 1;
-                }
-                batch.n_tokens = (int) chunk;
-                if (llama_decode(ctx, batch) != 0) {
-                    LOG_ERR("dspark_cycle_dflash feed decode failed\n");
-                    feed_ok = false;
+            // --- 2. Target feed [*draft_tokens] (γ tokens, NO anchor). ---
+            // The anchor was already fed in step 0. Feed only the drafts to
+            // avoid duplicating the anchor. p_t[1..γ] come from these logits;
+            // p_t[0] was set in step 0.
+            {
+                std::vector<llama_token> feed_tokens;
+                for (int k = 0; k < g; k++) feed_tokens.push_back((llama_token) draft_tokens[k]);
+                int n_feed = (int) feed_tokens.size();   // gamma
+                bool feed_ok = true;
+                size_t f_idx = 0;
+                while (f_idx < (size_t) n_feed) {
+                    size_t chunk = std::min((size_t) n_batch, (size_t) n_feed - f_idx);
+                    llama_batch batch = llama_batch_init((int) chunk, 0, 1);
+                    for (size_t i = 0; i < chunk; i++) {
+                        batch.token[i]    = feed_tokens[f_idx + i];
+                        batch.pos[i]      = n_past + (llama_pos) i;
+                        batch.n_seq_id[i] = 1;
+                        batch.seq_id[i][0] = seq_id;
+                        batch.logits[i]   = 1;
+                    }
+                    batch.n_tokens = (int) chunk;
+                    if (llama_decode(ctx, batch) != 0) {
+                        LOG_ERR("dspark_cycle_dflash feed decode failed\n");
+                        feed_ok = false;
+                        llama_batch_free(batch);
+                        break;
+                    }
+                    for (size_t i = 0; i < chunk; i++) {
+                        const float * lg = llama_get_logits_ith(ctx, (int32_t) i);
+                        if (!lg) { feed_ok = false; break; }
+                        // Batch index (f_idx+i) = draft[f_idx+i] at position
+                        // n_past_start_feed + (f_idx+i). Its logits predict
+                        // draft[f_idx+i+1]. So p_t row = f_idx+i+1.
+                        float * dst = p_t.data() + (size_t) (f_idx + i + 1) * Vd;
+                        for (int v = 0; v < Vd; v++) dst[v] = lg[v];
+                    }
+                    n_past += (llama_pos) chunk;
+                    f_idx += chunk;
                     llama_batch_free(batch);
-                    break;
                 }
-                for (size_t i = 0; i < chunk; i++) {
-                    const float * lg = llama_get_logits_ith(ctx, (int32_t) i);
-                    if (!lg) { feed_ok = false; break; }
-                    float * dst = p_t.data() + (size_t) (f_idx + i) * Vd;
-                    for (int v = 0; v < Vd; v++) dst[v] = lg[v];
-                }
-                n_past += (llama_pos) chunk;
-                f_idx += chunk;
-                llama_batch_free(batch);
+                if (!feed_ok) { write_header_err("dspark_cycle_dflash target feed failed"); continue; }
             }
-            if (!feed_ok) { write_header_err("dspark_cycle_dflash target feed failed"); continue; }
-            // Update last_hidden to the LAST fed token's hidden state.
+            // Update last_hidden to the LAST fed token.
             if (ba.embedding) {
-                const float * em_last = llama_get_embeddings_ith(ctx, (int32_t) (n_feed - 1));
+                const float * em_last = llama_get_embeddings_ith(ctx, (int32_t) (g - 1));
                 if (em_last) last_hidden.assign(em_last, em_last + n_embd);
             }
-            // Softmax each target distribution row in place.
-            for (int k = 0; k < n_feed; k++) {
+            // Softmax each target distribution row (γ+1 rows: 0..γ).
+            for (int k = 0; k <= g; k++) {
                 (void) softmax_inplace(p_t.data() + (size_t) k * Vd, Vd);
             }
 
-            // --- 3. C++ rejection sampler (Leviathan-2023). ---
+            // --- 3. Leviathan rejection sampler. ---
             std::vector<int32_t> accepted_tokens;
             accepted_tokens.reserve(g + 1);
             int n_accepted = 0;
@@ -1894,7 +1941,6 @@ int main(int argc, char ** argv) {
                     n_accepted += 1;
                     continue;
                 }
-                // Resample from normalized(max(0, p - q)).
                 std::vector<float> resample_scratch((size_t) Vd);
                 for (int v = 0; v < Vd; v++) {
                     float diff = p[v] - q[v];
@@ -1912,38 +1958,22 @@ int main(int argc, char ** argv) {
                 accepted_tokens.push_back((int32_t) bonus_token);
             }
 
-            // --- 4. KV-cache rollback for the un-verified suffix. ---
-            size_t committed = (size_t) (n_past - n_feed);  // n_pre
+            // --- 4. KV-cache rollback (n_start-based, no h_ctx extraction). ---
+            // Positions after step 0+2:
+            //   n_start     = anchor (step 0)
+            //   n_start+1+k = draft[k] (step 2)
+            // committed = first position to remove. h_ctx for next cycle comes
+            // from step 0 of THAT cycle (feed new anchor) — no extraction here.
+            size_t committed;
             if (reject_position < 0) {
-                committed += (size_t) (g + 1);
+                committed = (size_t) (n_start + g + 1);   // keep anchor + all drafts
             } else {
-                committed += (size_t) (reject_position + 1);
+                committed = (size_t) (n_start + reject_position + 1);  // keep anchor + draft[0..k-1]
             }
             if ((size_t) n_past > committed) {
                 llama_memory_seq_rm(llama_get_memory(ctx), seq_id, (llama_pos) committed, -1);
                 n_past = (llama_pos) committed;
             }
-            // Update last_hidden + last_h_ctx at the committed position.
-            if (ba.embedding && committed > 0) {
-                const float * em_new = llama_get_embeddings_ith(ctx, (int32_t) (committed - 1));
-                if (em_new) last_hidden.assign(em_new, em_new + n_embd);
-                // Multi-layer context: extract from each enabled layer.
-                if (n_extract > 0) {
-                    std::vector<float> h_ctx_new;
-                    h_ctx_new.reserve((size_t) n_extract * n_embd);
-                    for (int32_t ei = 0; ei < n_extract; ei++) {
-                        int32_t lid = ba.extract_layers[ei];
-                        const float * layer = (const float *) llama_get_embeddings_layer_inp(ctx, (uint32_t) lid);
-                        if (!layer) { LOG_ERR("dspark_cycle_dflash: layer_inp(lid=%d) null at committed=%zu\n", lid, committed); break; }
-                        // For single-chunk feed: index = committed-1.
-                        const float * src = layer + (size_t) (committed - 1) * n_embd;
-                        h_ctx_new.insert(h_ctx_new.end(), src, src + n_embd);
-                    }
-                    if ((int) h_ctx_new.size() == n_h_ctx) last_h_ctx = h_ctx_new;
-                }
-            }
-            int new_anchor = accepted_tokens.back();
-            (void) new_anchor;
 
             // --- 5. Return. ---
             int n_out = (int) accepted_tokens.size();
@@ -1952,7 +1982,7 @@ int main(int argc, char ** argv) {
                 {"n_committed", (int64_t) n_out},
                 {"reject_position", (int64_t) reject_position},
                 {"bonus", (int64_t) bonus_token},
-                {"n_anchor", (int64_t) new_anchor},
+                {"n_anchor", (int64_t) accepted_tokens.back()},
             });
             write_bytes(accepted_tokens.data(), (size_t) n_out * sizeof(int32_t));
             write_floats(confidences.data(), (size_t) g);
