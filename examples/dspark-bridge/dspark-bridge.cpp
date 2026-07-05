@@ -1128,9 +1128,33 @@ int main(int argc, char ** argv) {
             if (ba.embedding && !all_embd.empty()) {
                 last_hidden.assign(all_embd.end() - n_embd, all_embd.end());
             }
-            write_header_ok((int) tok_buf.size(), V, n_embd);
+            // Story 7.Q / RedHat full-sequence DSpark capture: when
+            // --extract-layers is active, feed must expose the selected
+            // layer-input hiddens for the last fed token as well as logits.
+            // This matches the Python adapter contract: feed(tokens) returns
+            // logits/embeddings for all fed tokens and last_hidden_layers for
+            // the final fed token. Full-sequence capture feeds one token at a
+            // time, so the final-token context is exactly the per-token row.
+            std::vector<float> h_ctx_layers;
+            if (n_extract > 0) {
+                h_ctx_layers.reserve((size_t) n_extract * n_embd);
+                for (int32_t k = 0; k < n_extract; k++) {
+                    const float * layer = llama_get_embeddings_layer_inp(ctx, (uint32_t) ba.extract_layers[k]);
+                    if (!layer) { LOG_ERR("feed: get_embeddings_layer_inp(lid=%d) null\n", ba.extract_layers[k]); h_ctx_layers.clear(); break; }
+                    h_ctx_layers.insert(h_ctx_layers.end(), layer, layer + n_embd);
+                }
+            }
+            if (n_extract > 0 && h_ctx_layers.size() == (size_t) n_extract * n_embd) {
+                write_header_ok_kv({
+                    {"n", (int64_t) tok_buf.size()}, {"v", (int64_t) V}, {"embd", (int64_t) n_embd},
+                    {"embd_layers", (int64_t) n_extract},
+                });
+            } else {
+                write_header_ok((int) tok_buf.size(), V, n_embd);
+            }
             write_floats(all_logits.data(), all_logits.size());
             if (ba.embedding) write_floats(all_embd.data(), all_embd.size());
+            if (!h_ctx_layers.empty()) write_floats(h_ctx_layers.data(), h_ctx_layers.size());
             continue;
         } else if (op == "next_greedy") {
             // Fast single-token greedy advance for the capture sampling pass.
