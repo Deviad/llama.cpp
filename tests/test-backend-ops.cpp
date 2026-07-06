@@ -8894,6 +8894,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // k == n is allowed to return every index in any order.
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {555,  1, 1, 1}, 555));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2048, 1, 1, 1}, 2048));
+    // GLM-DSA single-row TOP_K pruning correctness cases.
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {4096,  1, 1, 1}, 2048));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192,  1, 1, 1}, 2048));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16384, 1, 1, 1}, 2048));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {18768, 1, 1, 1}, 2048));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {20480, 1, 1, 1}, 2048));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 1, 1, 1}, 2048));
 
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));

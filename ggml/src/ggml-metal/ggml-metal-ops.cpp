@@ -4410,7 +4410,40 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_tmp = bid_dst;
     bid_tmp.offs += sizeof(int32_t)*ggml_nelements(op->src[0]);
 
-    if ((int) ceil(std::log(npr) / std::log(2)) % 2 == 1) {
+    const int initial_run_len = std::min(nth, top_k);
+    int initial_total_len = ne00;
+    if (npr > 1) {
+        initial_total_len = (npr - 1)*initial_run_len + std::min(ne00 - (npr - 1)*nth, initial_run_len);
+    }
+
+    // For single-row large-K TOP_K (the GLM-DSA decode case), compact every
+    // intermediate merge run to the final top_k prefix. This preserves the same
+    // ordered prefix as the full bitonic+merge tree, but avoids carrying the
+    // whole row through later merge stages.
+    const bool use_prune_top_k = getenv("GGML_METAL_TOP_K_DISABLE_PRUNE") == nullptr &&
+            op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+            ne01 == 1 && ne02 == 1 && ne03 == 1 &&
+            top_k >= 1024 && initial_run_len < top_k && initial_total_len > top_k;
+
+    if (use_prune_top_k) {
+        int n_merge_prune = 0;
+        int cur_total = initial_total_len;
+        int cur_run   = initial_run_len;
+        while (cur_total > top_k) {
+            const int out_run = std::min(2*cur_run, top_k);
+            const int nm = (cur_total + 2*cur_run - 1) / (2*cur_run);
+            const int last_start = (nm - 1) * 2 * cur_run;
+            const int last_total = std::min(cur_run, std::max(0, cur_total - last_start)) +
+                                   std::min(cur_run, std::max(0, cur_total - (last_start + cur_run)));
+            cur_total = (nm - 1)*out_run + std::min(last_total, out_run);
+            cur_run = out_run;
+            n_merge_prune++;
+        }
+
+        if (n_merge_prune % 2 == 1) {
+            std::swap(bid_dst, bid_tmp);
+        }
+    } else if ((int) ceil(std::log(npr) / std::log(2)) % 2 == 1) {
         std::swap(bid_dst, bid_tmp);
     }
 
@@ -4427,11 +4460,11 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
         /*.ne1   =*/ ne1,
         /*.ne2   =*/ ne2,
         /*.ne3   =*/ ne3,
-        /*.top_k =*/ std::min(nth, top_k), // for each block, keep just the top_k indices
+        /*.top_k =*/ initial_run_len, // for each block, keep just the top_k indices
     };
 
     if (npr > 1) {
-        args.ne0 = (npr - 1)*args.top_k + std::min(ne00 - (npr - 1)*nth, args.top_k);
+        args.ne0 = initial_total_len;
     }
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -4442,6 +4475,62 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, npr*ne01, ne02, ne03, nth, 1, 1);
+
+    if (use_prune_top_k) {
+        const char * base_prune = "kernel_argsort_merge_prune_f32_i32_desc";
+        auto pipeline_prune = ggml_metal_library_get_pipeline(lib, base_prune);
+        if (!pipeline_prune.pipeline) {
+            pipeline_prune = ggml_metal_library_compile_pipeline(lib, base_prune, base_prune, nullptr);
+        }
+
+        ggml_metal_buffer_id bid_in  = bid_dst;
+        ggml_metal_buffer_id bid_out = bid_tmp;
+
+        int cur_total = args.ne0;
+        int cur_run   = args.top_k;
+
+        while (cur_total > top_k) {
+            ggml_metal_op_concurrency_reset(ctx);
+
+            const int out_run = std::min(2*cur_run, top_k);
+            const int nm = (cur_total + 2*cur_run - 1) / (2*cur_run);
+            const int nth_merge = std::min(512, std::min(out_run, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_prune)));
+
+            ggml_metal_kargs_argsort_merge args_merge = {
+                /*.ne00  =*/ ne00,
+                /*.ne01  =*/ ne01,
+                /*.ne02  =*/ ne02,
+                /*.ne03  =*/ ne03,
+                /*.nb00  =*/ nb00,
+                /*.nb01  =*/ nb01,
+                /*.nb02  =*/ nb02,
+                /*.nb03  =*/ nb03,
+                /*.ne0   =*/ cur_total,
+                /*.ne1   =*/ ne1,
+                /*.ne2   =*/ ne2,
+                /*.ne3   =*/ ne3,
+                /*.top_k =*/ out_run,
+                /*.len   =*/ cur_run,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline_prune);
+            ggml_metal_encoder_set_bytes   (enc, &args_merge, sizeof(args_merge), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_in,   2);
+            ggml_metal_encoder_set_buffer  (enc, bid_out,  3);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, nm, 1, 1, nth_merge, 1, 1);
+
+            const int last_start = (nm - 1) * 2 * cur_run;
+            const int last_total = std::min(cur_run, std::max(0, cur_total - last_start)) +
+                                   std::min(cur_run, std::max(0, cur_total - (last_start + cur_run)));
+            cur_total = (nm - 1)*out_run + std::min(last_total, out_run);
+            cur_run = out_run;
+            std::swap(bid_in, bid_out);
+        }
+
+        return 1;
+    }
 
     auto pipeline_merge = ggml_metal_library_get_pipeline_top_k_merge(lib, op);
 
