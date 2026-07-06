@@ -2318,7 +2318,20 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // to the matrix-vector kernel
     // ne20 = n_used_experts
     // ne21 = n_rows (batch size)
-    const int ne21_mm_id_min = 32;
+    //
+    // Story 7.S lever-2 probe: the mm_id path's map0 kernel already dedups
+    // expert weight reads (tokens grouped per expert, weights streamed once
+    // per expert). GGML_METAL_MM_ID_MIN overrides the break-even threshold so
+    // small speculative verify batches (gamma+1 = 2..4 tokens) can be tested
+    // on the dedup path without a new kernel. Default unchanged (32).
+    static const int ne21_mm_id_min = [] {
+        const char * s = getenv("GGML_METAL_MM_ID_MIN");
+        if (s == nullptr) {
+            return 32;
+        }
+        const int v = atoi(s);
+        return v < 1 ? 1 : v;
+    }();
 
     if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
         // some Metal matrix data types require aligned pointers
