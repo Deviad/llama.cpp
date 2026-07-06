@@ -925,6 +925,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // pre-advancement before process() mirrored the verify batch.
     std::vector<uint16_t> last_n_drafted;
 
+    // Story 7.S AC5 — opt-in phase profiling (LLAMA_SPEC_MTP_PROFILE=1).
+    // Accumulates wall time per draft-side phase to identify whether the
+    // ~100+ ms/cycle draft cost is catch-up decode, draft decode, or
+    // sampling/logits readback. Printed via logs every 16 cycles.
+    bool    prof_enabled    = getenv("LLAMA_SPEC_MTP_PROFILE") != nullptr;
+    int64_t prof_t_catchup  = 0; // us, process(): catch-up llama_decode
+    int64_t prof_t_embd     = 0; // us, process(): nextn embd readback/memcpy
+    int64_t prof_t_draft0   = 0; // us, draft(): first llama_decode
+    int64_t prof_t_draft_n  = 0; // us, draft(): subsequent llama_decode calls
+    int64_t prof_t_sample   = 0; // us, draft(): common_sampler_sample + readback
+    int64_t prof_n_cycles   = 0;
+    int64_t prof_n_catchup_tokens = 0;
+    int64_t prof_n_draft_tokens   = 0;
+
+    void prof_report() {
+        if (!prof_enabled || prof_n_cycles == 0 || (prof_n_cycles % 16) != 0) {
+            return;
+        }
+        LOG_INF("spec-mtp-prof: cycles=%lld catchup=%.2f ms/cyc (%lld tok) "
+                "embd=%.2f ms/cyc draft0=%.2f ms/cyc draftN=%.2f ms/cyc "
+                "sample=%.2f ms/cyc (%lld draft tok)\n",
+                (long long) prof_n_cycles,
+                prof_t_catchup / 1000.0 / prof_n_cycles, (long long) prof_n_catchup_tokens,
+                prof_t_embd    / 1000.0 / prof_n_cycles,
+                prof_t_draft0  / 1000.0 / prof_n_cycles,
+                prof_t_draft_n / 1000.0 / prof_n_cycles,
+                prof_t_sample  / 1000.0 / prof_n_cycles,
+                (long long) prof_n_draft_tokens);
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1066,6 +1096,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        const int64_t prof_t0 = prof_enabled ? ggml_time_us() : 0;
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             common_batch_clear(batch);
@@ -1104,6 +1136,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        const int64_t prof_t1 = prof_enabled ? ggml_time_us() : 0;
+        if (prof_enabled) {
+            prof_t_catchup += prof_t1 - prof_t0;
+            prof_n_catchup_tokens += n_tokens;
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
@@ -1120,6 +1158,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+        }
+
+        if (prof_enabled) {
+            prof_t_embd += ggml_time_us() - prof_t1;
         }
 
         return true;
@@ -1154,10 +1196,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
         }
 
+        const int64_t prof_d0 = prof_enabled ? ggml_time_us() : 0;
+
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
+        }
+
+        if (prof_enabled) {
+            prof_t_draft0 += ggml_time_us() - prof_d0;
+            prof_n_cycles++;
+            prof_report();
         }
 
         int i = 0;
@@ -1174,8 +1224,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                const int64_t prof_s0 = prof_enabled ? ggml_time_us() : 0;
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
+                if (prof_enabled) {
+                    prof_t_sample += ggml_time_us() - prof_s0;
+                    prof_n_draft_tokens++;
+                }
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -1225,7 +1280,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             // evaluate the drafted tokens on the draft model
+            const int64_t prof_dn0 = prof_enabled ? ggml_time_us() : 0;
             ret = llama_decode(ctx_dft, batch);
+            if (prof_enabled) {
+                prof_t_draft_n += ggml_time_us() - prof_dn0;
+            }
             if (ret != 0) {
                 LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);
                 break;
