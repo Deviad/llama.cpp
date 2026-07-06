@@ -2631,6 +2631,113 @@ ggml_tensor * llm_graph_context::build_attn(
         return cur;
     }
 
+    // PLAN.md §7.S — sparse-gather DSA attention for small verify batches.
+    //
+    // The speculative MTP verify step decodes gamma+1 tokens in one batch.
+    // Before this path, any n_tokens > 1 fell back to masked-dense attention
+    // over ALL cached keys (O(n_kv) per layer), which is why native MTP lost
+    // to sparse direct decode at long context. Here each batch token gathers
+    // only its own causally-valid top_k rows and attends unmasked, exactly
+    // like the single-token path above, looped per token.
+    //
+    // Correctness: batch token i sits at cache position n_kv-1-(n_tokens-1-i),
+    // so it has n_valid_i = n_kv-(n_tokens-1-i) causally-valid keys. The
+    // indexer mask pushed future/invalid positions to -INFINITY BEFORE
+    // ggml_top_k, and ggml_top_k orders by score descending, so the first
+    // min(n_top_k, n_valid_i) entries of token i's top_k column are exactly
+    // its valid selections (valid scores are relu>=0 > -INFINITY). This is
+    // set-identical to what the dense fallback's (unmask top_k) + causal-mask
+    // combination attends to, hence no mask is needed on the gathered subset.
+    //
+    // Gated to small batches (default cap 8: speculative verify / MTP catch-up),
+    // prefill keeps the dense fallback. Kill switch: LLAMA_DSA_SPARSE_VERIFY=0;
+    // cap override: LLAMA_DSA_SPARSE_VERIFY_MAX=N.
+    static const bool sparse_verify = sparse_gather &&
+        (getenv("LLAMA_DSA_SPARSE_VERIFY") == nullptr || strcmp(getenv("LLAMA_DSA_SPARSE_VERIFY"), "0") != 0);
+    static const int64_t sparse_verify_max = [] {
+        const char * s = getenv("LLAMA_DSA_SPARSE_VERIFY_MAX");
+        if (s == nullptr) {
+            return (int64_t) 8;
+        }
+        const int64_t v = (int64_t) atoll(s);
+        return v < 1 ? (int64_t) 1 : v;
+    }();
+    if (sparse_verify && n_tokens > 1 && n_tokens <= sparse_verify_max) {
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        // same layout assumptions as the single-token path: MQA n_head_kv=1,
+        // single stream, and one top_k column per batch token. Anything else
+        // (multi-stream server batches) falls through to the dense fallback.
+        //
+        // Additionally require n_kv > n_top_k + n_tokens: below that, every
+        // token's valid-key count is near/below top_k so the dense fallback is
+        // cheap anyway, and the padded-cache n_valid arithmetic here would risk
+        // gathering unmasked garbage rows at short context (bug found in the
+        // first 7.S iteration).
+        const int64_t n_kv_gate    = k->ne[2];
+        const int64_t n_top_k_gate = top_k->ne[0];
+        if (k->ne[1] == 1 && k->ne[3] == 1 && top_k->ne[1] == n_tokens && top_k->ne[3] == 1 &&
+            n_kv_gate > n_top_k_gate + n_tokens) {
+            const int64_t n_kv    = k->ne[2];
+            const int64_t n_top_k = top_k->ne[0];
+
+            ggml_tensor * k_2d = ggml_view_2d(ctx0, k, k->ne[0], n_kv, k->nb[2], 0); // [d, n_kv]
+
+            ggml_tensor * cur = nullptr;
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                const int64_t n_valid  = n_kv - (n_tokens - 1 - i);
+                const int64_t n_gather = n_top_k < n_valid ? n_top_k : n_valid;
+
+                // token i's top_k column, first n_gather (= causally valid) entries
+                ggml_tensor * idx_i = ggml_view_1d(ctx0, top_k, n_gather, i*top_k->nb[1]);
+
+                // 7.S quality fix: re-sort the gathered indices into ascending
+                // cache order before gathering. top_k emits indices in score
+                // order; attending over score-ordered keys changes the FP
+                // summation order in softmax/KQV vs the dense path (which
+                // attends in cache order), and that reordering alone was enough
+                // to deterministically flip near-tie tokens at 18.7k (strict
+                // BLUE-FALCON retrieval: -021 instead of -48217; same failure
+                // class as the rejected unordered-radix TOP_K). Sorting costs
+                // one tiny argsort per token/layer and restores cache-order
+                // summation. ggml_argsort sorts F32 rows, so cast I32->F32
+                // (indices < 2^24, exactly representable).
+                ggml_tensor * idx_f32  = ggml_cast(ctx0, idx_i, GGML_TYPE_F32);
+                ggml_tensor * idx_perm = ggml_argsort(ctx0, idx_f32, GGML_SORT_ORDER_ASC); // I32 perm
+                idx_i = ggml_get_rows(ctx0,
+                        ggml_reshape_2d(ctx0, idx_i, 1, n_gather), idx_perm);              // [1, n_gather] I32
+                idx_i = ggml_reshape_1d(ctx0, idx_i, n_gather);
+
+                ggml_tensor * k_g2d = ggml_get_rows(ctx0, k_2d, idx_i); // [d, n_gather] (F32)
+                ggml_tensor * k_g   = ggml_reshape_4d(ctx0, k_g2d, k->ne[0], 1, n_gather, 1);
+                k_g = ggml_cpy(ctx0, k_g, ggml_new_tensor_4d(ctx0, k->type,
+                                k_g->ne[0], k_g->ne[1], k_g->ne[2], k_g->ne[3]));
+                cb(k_g, "k_gathered_verify", il);
+
+                // V is a view of the gathered K's first kv_lora_rank rows (absorbed MQA form)
+                ggml_tensor * v_g = ggml_view_4d(ctx0, k_g, v_cur->ne[0],
+                                                 k_g->ne[1], k_g->ne[2], k_g->ne[3],
+                                                 k_g->nb[1], k_g->nb[2], k_g->nb[3], 0);
+                cb(v_g, "v_gathered_verify", il);
+
+                // token i's query slice: q_cur is [d_q, n_head, n_tokens]
+                ggml_tensor * q_i = ggml_view_3d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], 1,
+                                                 q_cur->nb[1], q_cur->nb[2], i*q_cur->nb[2]);
+
+                ggml_tensor * out_i = build_attn_mha(q_i, k_g, v_g, kq_b, nullptr, sinks, v_mla, kq_scale, il);
+                cur = cur == nullptr ? out_i : ggml_concat(ctx0, cur, out_i, 1);
+            }
+            cb(cur, "kqv_out_sparse_verify", il);
+
+            if (wo) {
+                cur = build_lora_mm(wo, cur, wo_s);
+            }
+            if (wo_b) {
+                cur = ggml_add(ctx0, cur, wo_b);
+            }
+            return cur;
+        }
+    }
+
     // ── default: masked-dense attention (frozen baseline, unchanged) ──
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
