@@ -1156,6 +1156,53 @@ int main(int argc, char ** argv) {
             if (ba.embedding) write_floats(all_embd.data(), all_embd.size());
             if (!h_ctx_layers.empty()) write_floats(h_ctx_layers.data(), h_ctx_layers.size());
             continue;
+        } else if (op == "prefill") {
+            // Decode tokens into KV without returning logits/embeddings. This is
+            // for verifier-cost benchmarks where prefill is setup, not part of
+            // the timed split verifier cycle. It avoids shipping O(N*V) logits
+            // across the pipe just to establish a prefix.
+            if (!req.contains("tokens") || !req["tokens"].is_array()) {
+                write_header_err("prefill requires tokens[]");
+                continue;
+            }
+            auto & arr = req["tokens"];
+            tok_buf.clear();
+            bool bad = false;
+            for (auto & t : arr) {
+                if (!t.is_number_integer()) {
+                    write_header_err("tokens[] must be ints");
+                    bad = true;
+                    break;
+                }
+                tok_buf.push_back((llama_token) t.get<int32_t>());
+            }
+            if (bad) continue;
+            bool ok = true;
+            size_t idx = 0;
+            while (idx < tok_buf.size()) {
+                size_t chunk = std::min((size_t) n_batch, tok_buf.size() - idx);
+                llama_batch batch = llama_batch_init((int) chunk, 0, 1);
+                for (size_t i = 0; i < chunk; i++) {
+                    batch.token[i]    = tok_buf[idx + i];
+                    batch.pos[i]      = n_past + (llama_pos) i;
+                    batch.n_seq_id[i] = 1;
+                    batch.seq_id[i][0] = seq_id;
+                    batch.logits[i]   = 0;
+                }
+                batch.n_tokens = (int) chunk;
+                if (llama_decode(ctx, batch) != 0) {
+                    LOG_ERR("prefill llama_decode failed at idx=%zu n_past=%d\n", idx, (int) n_past);
+                    ok = false;
+                    llama_batch_free(batch);
+                    break;
+                }
+                n_past += (llama_pos) chunk;
+                idx += chunk;
+                llama_batch_free(batch);
+            }
+            if (!ok) { write_header_err("prefill decode failed"); continue; }
+            write_header_ok_kv({{"n", (int64_t) tok_buf.size()}, {"n_past", (int64_t) n_past}});
+            continue;
         } else if (op == "next_greedy") {
             // Fast single-token greedy advance for the capture sampling pass.
             // Returns ONLY the argmax token id (int32) + hidden (E float32) —
@@ -1600,6 +1647,126 @@ int main(int argc, char ** argv) {
             });
             write_bytes(accepted_tokens.data(), (size_t) n_out * sizeof(int32_t));
             write_floats(confidences.data(), g);
+            continue;
+        } else if (op == "dspark_cycle_split_greedy") {
+            // Split-cycle deterministic batched greedy verifier for an external
+            // Python drafter. This is the token-only verifier-cost upper-bound:
+            // no p_d payload, no distribution-correct Leviathan sampling, and
+            // no target softmax. It is intentionally NOT exact direct-D5 greedy
+            // on GLM-5.2 D5 because batched verifier logits can differ from the
+            // single-token next_greedy path on this quant/model.
+            if (!req.contains("anchor_token") || !req["anchor_token"].is_number_integer()) {
+                write_header_err("dspark_cycle_split_greedy requires anchor_token:int");
+                continue;
+            }
+            int anchor_tok = req["anchor_token"].get<int>();
+            if (anchor_tok < 0 || anchor_tok >= (int) V) {
+                write_header_err("anchor_token out of range [0, V)");
+                continue;
+            }
+            if (!req.contains("draft_tokens") || !req["draft_tokens"].is_array()) {
+                write_header_err("dspark_cycle_split_greedy requires draft_tokens:int[gamma]");
+                continue;
+            }
+            auto j_drafts = req["draft_tokens"];
+            int g = (int) j_drafts.size();
+            if (g <= 0 || g > 64) {
+                write_header_err("draft_tokens length out of range (1..64)");
+                continue;
+            }
+            std::vector<int32_t> draft_tokens(g);
+            bool bad_draft = false;
+            for (int k = 0; k < g; k++) {
+                if (!j_drafts[k].is_number_integer()) { bad_draft = true; break; }
+                int t = j_drafts[k].get<int>();
+                if (t < 0 || t >= (int) V) { bad_draft = true; break; }
+                draft_tokens[k] = (int32_t) t;
+            }
+            if (bad_draft) { write_header_err("draft_tokens must be valid token ids"); continue; }
+            std::vector<float> confidences(g, 0.0f);
+            if (req.contains("confidences") && req["confidences"].is_array()) {
+                auto j_conf = req["confidences"];
+                if ((int) j_conf.size() == g) {
+                    for (int k = 0; k < g; k++) confidences[k] = (float) j_conf[k].get<double>();
+                }
+            }
+            const int n_feed = g + 1;  // anchor + gamma drafts
+            std::vector<llama_token> feed_tokens;
+            feed_tokens.reserve((size_t) n_feed);
+            feed_tokens.push_back((llama_token) anchor_tok);
+            for (int k = 0; k < g; k++) feed_tokens.push_back((llama_token) draft_tokens[k]);
+            std::vector<int32_t> target_argmax((size_t) n_feed, -1);
+            bool feed_ok = true;
+            size_t f_idx = 0;
+            while (f_idx < (size_t) n_feed) {
+                size_t chunk = std::min((size_t) n_batch, (size_t) n_feed - f_idx);
+                llama_batch batch = llama_batch_init((int) chunk, 0, 1);
+                for (size_t i = 0; i < chunk; i++) {
+                    batch.token[i]    = feed_tokens[f_idx + i];
+                    batch.pos[i]      = n_past + (llama_pos) i;
+                    batch.n_seq_id[i] = 1;
+                    batch.seq_id[i][0] = seq_id;
+                    batch.logits[i]   = 1;
+                }
+                batch.n_tokens = (int) chunk;
+                if (llama_decode(ctx, batch) != 0) {
+                    LOG_ERR("dspark_cycle_split_greedy feed decode failed\n");
+                    feed_ok = false;
+                    llama_batch_free(batch);
+                    break;
+                }
+                for (size_t i = 0; i < chunk; i++) {
+                    const float * lg = llama_get_logits_ith(ctx, (int32_t) i);
+                    if (!lg) { feed_ok = false; break; }
+                    target_argmax[f_idx + i] = (int32_t) argmax(lg, (int) V);
+                }
+                n_past += (llama_pos) chunk;
+                f_idx += chunk;
+                llama_batch_free(batch);
+            }
+            if (!feed_ok) { write_header_err("dspark_cycle_split_greedy target feed failed"); continue; }
+
+            std::vector<int32_t> accepted_tokens;
+            accepted_tokens.reserve(g + 1);
+            int n_accepted = 0;
+            int reject_position = -1;
+            for (int k = 0; k < g; k++) {
+                if (draft_tokens[k] == target_argmax[k]) {
+                    accepted_tokens.push_back(draft_tokens[k]);
+                    n_accepted += 1;
+                    continue;
+                }
+                accepted_tokens.push_back(target_argmax[k]);
+                reject_position = k;
+                break;
+            }
+            int bonus_token = -1;
+            if (reject_position < 0) {
+                bonus_token = target_argmax[g];
+                accepted_tokens.push_back((int32_t) bonus_token);
+            }
+
+            size_t committed = (size_t) (n_past - n_feed);  // n_pre
+            if (reject_position < 0) {
+                committed += (size_t) (g + 1);          // anchor + all drafts (bonus not fed)
+            } else {
+                committed += (size_t) (reject_position + 1);  // anchor + accepted drafts before reject
+            }
+            if ((size_t) n_past > committed) {
+                llama_memory_seq_rm(llama_get_memory(ctx), seq_id, (llama_pos) committed, -1);
+                n_past = (llama_pos) committed;
+            }
+            int new_anchor = accepted_tokens.back();
+            int n_out = (int) accepted_tokens.size();
+            write_header_ok_kv({
+                {"n_accepted", (int64_t) n_accepted},
+                {"n_committed", (int64_t) n_out},
+                {"reject_position", (int64_t) reject_position},
+                {"bonus", (int64_t) bonus_token},
+                {"n_anchor", (int64_t) new_anchor},
+            });
+            write_bytes(accepted_tokens.data(), (size_t) n_out * sizeof(int32_t));
+            write_floats(confidences.data(), (size_t) g);
             continue;
         } else if (op == "dspark_cycle_split") {
             // Story S31 AC4: split cycle — drafter runs in PYTHON (DFlash via
