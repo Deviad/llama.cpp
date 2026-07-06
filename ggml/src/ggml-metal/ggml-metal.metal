@@ -5558,6 +5558,26 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_asc")]]  kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_ASC>;
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_DESC>;
 
+kernel void kernel_top_k_full_i32(
+        constant ggml_metal_kargs_argsort & args,
+        device       int32_t * dst,
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort3 tpitg [[thread_position_in_threadgroup]],
+        ushort3   ntg [[threads_per_threadgroup]]) {
+    const int i01 = tgpig[0];
+    const int i02 = tgpig[1];
+    const int i03 = tgpig[2];
+
+    device int32_t * dst_row = dst
+        + i01*args.ne0
+        + i02*args.ne0*args.ne1
+        + i03*args.ne0*args.ne1*args.ne2;
+
+    for (int idx = tpitg[0]; idx < args.ne00; idx += ntg[0]) {
+        dst_row[idx] = (int32_t) idx;
+    }
+}
+
 typedef void (argsort_merge_t)(
         constant   ggml_metal_kargs_argsort_merge & args,
         device const char    * src0,

@@ -4351,6 +4351,41 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
+    const int top_k = ne0;
+
+    if (top_k == ne00) {
+        ggml_metal_kargs_argsort args = {
+            /*.ne00  =*/ ne00,
+            /*.ne01  =*/ ne01,
+            /*.ne02  =*/ ne02,
+            /*.ne03  =*/ ne03,
+            /*.nb00  =*/ nb00,
+            /*.nb01  =*/ nb01,
+            /*.nb02  =*/ nb02,
+            /*.nb03  =*/ nb03,
+            /*.ne0   =*/ ne0,
+            /*.ne1   =*/ ne1,
+            /*.ne2   =*/ ne2,
+            /*.ne3   =*/ ne3,
+            /*.top_k =*/ top_k,
+        };
+
+        const char * base = "kernel_top_k_full_i32";
+        auto pipeline = ggml_metal_library_get_pipeline(lib, base);
+        if (!pipeline.pipeline) {
+            pipeline = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+        }
+
+        ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,  1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, 256, 1, 1);
+
+        return 1;
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_top_k(lib, op);
 
     // ---- bitonic argsort + merge path (default) ----
@@ -4378,8 +4413,6 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     if ((int) ceil(std::log(npr) / std::log(2)) % 2 == 1) {
         std::swap(bid_dst, bid_tmp);
     }
-
-    const int top_k = ne0;
 
     ggml_metal_kargs_argsort args = {
         /*.ne00  =*/ ne00,
