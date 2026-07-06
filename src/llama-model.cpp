@@ -2031,6 +2031,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // this it fell through to the dense default cache, so the
                 // indexer ran nowhere and long-context decode was dense O(n).
                 // See PLAN.md §7.L.
+                llama_kv_cache_dsa::layer_filter_cb filter = nullptr;
+                if (arch == LLM_ARCH_GLM_DSA && hparams.n_layer_nextn > 0) {
+                    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                        // The native GLM-DSA MTP context executes only the
+                        // NextN decoder block(s), e.g. GLM-5.2 blk.78.
+                        filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    } else {
+                        // The normal target graph executes only trunk layers.
+                        // Avoid allocating KV for executable MTP blocks here.
+                        filter = [&](uint32_t il) { return il < hparams.n_layer(); };
+                    }
+                }
+
                 res = new llama_kv_cache_dsa(
                         *this,
                         params.type_k,
@@ -2043,7 +2056,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         1,
                         hparams.n_swa,
                         hparams.swa_type,
-                        nullptr,
+                        filter,
                         nullptr);
             } break;
         // Models that need standard caching should rely on recurrent/hybrid
