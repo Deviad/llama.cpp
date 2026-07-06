@@ -552,15 +552,25 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
-    mctx->get_mla()->set_input_k_idxs(self_k_idxs_mla, ubatch);
+    if (self_k_idxs_mla && self_k_idxs_mla->buffer) {
+        mctx->get_mla()->set_input_k_idxs(self_k_idxs_mla, ubatch);
+    }
 
-    mctx->get_mla()->set_input_kq_mask(self_kq_mask_mla, ubatch, cparams.causal_attn);
+    if (self_kq_mask_mla && self_kq_mask_mla->buffer) {
+        mctx->get_mla()->set_input_kq_mask(self_kq_mask_mla, ubatch, cparams.causal_attn);
+    }
 
-    mctx->get_lid()->set_input_k_idxs(self_k_idxs_lid, ubatch);
+    if (self_k_idxs_lid && self_k_idxs_lid->buffer) {
+        mctx->get_lid()->set_input_k_idxs(self_k_idxs_lid, ubatch);
+    }
 
-    mctx->get_lid()->set_input_kq_mask(self_kq_mask_lid, ubatch, cparams.causal_attn);
+    if (self_kq_mask_lid && self_kq_mask_lid->buffer) {
+        mctx->get_lid()->set_input_kq_mask(self_kq_mask_lid, ubatch, cparams.causal_attn);
+    }
 
-    mctx->get_lid()->set_input_k_rot(self_k_rot_lid);
+    if (self_k_rot_lid && self_k_rot_lid->buffer) {
+        mctx->get_lid()->set_input_k_rot(self_k_rot_lid);
+    }
 }
 
 bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
@@ -2572,8 +2582,11 @@ ggml_tensor * llm_graph_context::build_attn(
     // back to the dense masked path below. Multi-token prefill sparse-gather
     // (with a per-gather validity mask) is a follow-up AC.
     //
-    // Frozen-baseline safety: default (env unset) is the unchanged dense path.
-    static const bool sparse_gather = getenv("LLAMA_DSA_SPARSE_GATHER") != nullptr;
+    // Daily-driver default: sparse DSA decode is enabled for single-token decode.
+    // Use LLAMA_DSA_DENSE_ATTENTION=1 (or LLAMA_DSA_SPARSE_GATHER=0 for old
+    // scripts) to force the original masked-dense fallback for debugging.
+    static const bool sparse_gather = getenv("LLAMA_DSA_DENSE_ATTENTION") == nullptr &&
+        (getenv("LLAMA_DSA_SPARSE_GATHER") == nullptr || strcmp(getenv("LLAMA_DSA_SPARSE_GATHER"), "0") != 0);
     if (sparse_gather && n_tokens == 1) {
         // full MLA K cache: [d, n_head_kv=1, n_kv, n_stream] (decode: [576,1,n_kv,1])
         ggml_tensor * k = mctx_cur->get_k(ctx0, il);
@@ -2601,11 +2614,9 @@ ggml_tensor * llm_graph_context::build_attn(
                                                 k_gathered->nb[1], k_gathered->nb[2], k_gathered->nb[3], 0);
         cb(v_gathered, "v_gathered", il);
 
-        // Keep the MLA kq_mask input referenced so the scheduler allocates a buffer
-        // for it (set_input_kq_mask writes to it unconditionally). For decode every
-        // gathered row is a valid past position, so the gathered attention needs no
-        // mask; we pass nullptr to build_attn_mha but keep kq_mask alive here.
-        ggml_build_forward_expand(gf, kq_mask);
+        // For decode every gathered row is a valid past position, so the gathered
+        // attention needs no mask. The DSA input setter skips unbacked tensors, so
+        // the unused dense MLA mask is not allocated or filled on this path.
 
         // dense attention over the small gathered subset, no mask
         ggml_tensor * cur = build_attn_mha(q_cur, k_gathered, v_gathered, kq_b, nullptr, sinks, v_mla, kq_scale, il);
