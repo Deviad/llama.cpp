@@ -8979,26 +8979,34 @@ void kernel_mul_mv_iq2_s_f32_impl(
     device const block_iq2_s * x = (device const block_iq2_s *) (src0 + offset0);
     device const float       * y = (device const float       *) (src1 + offset1);
 
-    float yl[32];
+    // Story 7.T AC2a — vectorized IQ2_S inner loop.
+    //
+    // The previous loop performed 16 single-byte loads from the constant
+    // iq2s_grid per 32 values, 16 scalar kmask select() sign flips, and 16
+    // scalar FMAs — measured at only ~46% of peak memory bandwidth at GLM-5.2
+    // decode shapes (vs 67% for Q2_K, 81-83% for IQ4_NL; see
+    // quality-testing/dspark_benchmarks/glm52_kernel_roofline_ac1.json).
+    // Now: one uint64 load per grid entry, register unpack to uchar4, float4
+    // sign application, dot() accumulation. Weight bytes and math identical;
+    // only FP reassociation within 4-element groups.
+    float4 yl4[8];
     float sumf[nr0]={0.f};
 
     const int nb32 = nb * (QK_K / 32);
 
-    //threadgroup uint64_t * svalues = (threadgroup uint64_t *) shmem;
-    //{
-    //    int nval = 32;
-    //    int pos  = (32*sgitg + tiisg)*nval;
-    //    for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2s_grid[pos + i];
-    //    threadgroup_barrier(mem_flags::mem_threadgroup);
-    //}
+    // note: a threadgroup-memory cache of the 8 KB iq2s_grid was tried and
+    // REJECTED: at GLM-5.2 decode shapes each of the ~2048 threadgroups
+    // re-loads the full grid + barrier, costing more than the constant-memory
+    // gathers it replaces (87.3 vs 80.1 us/run). Keep constant-memory grid.
 
     const short ix = tiisg;
 
     device const float * y4 = y + 32 * ix;
 
     for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
-        for (short i = 0; i < 32; ++i) {
-            yl[i] = y4[i];
+        device const float4 * y44 = (device const float4 *) y4;
+        for (short i = 0; i < 8; ++i) {
+            yl4[i] = y44[i];
         }
 
         const int ibl = ib32 / (QK_K / 32);
@@ -9018,14 +9026,19 @@ void kernel_mul_mv_iq2_s_f32_impl(
 
             float2 sum = {0};
             for (short l = 0; l < 2; ++l) {
-                //const threadgroup uint8_t * grid1 = (const threadgroup uint8_t *)(svalues + (qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)));
-                //const threadgroup uint8_t * grid2 = (const threadgroup uint8_t *)(svalues + (qs[l+2] | ((qh[0] << (4-2*l)) & 0x300)));
-                constant uint8_t * grid1 = (constant uint8_t *)(iq2s_grid + (qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)));
-                constant uint8_t * grid2 = (constant uint8_t *)(iq2s_grid + (qs[l+2] | ((qh[0] << (4-2*l)) & 0x300)));
-                for (short j = 0; j < 8; ++j) {
-                    sum[0] += yl[8*l + j +  0] * grid1[j] * select(1, -1, signs[l+0] & kmask_iq2xs[j]);
-                    sum[1] += yl[8*l + j + 16] * grid2[j] * select(1, -1, signs[l+2] & kmask_iq2xs[j]);
-                }
+                const uint2 g1 = as_type<uint2>(iq2s_grid[qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)]);
+                const uint2 g2 = as_type<uint2>(iq2s_grid[qs[l+2] | ((qh[0] << (4-2*l)) & 0x300)]);
+
+                const short s1 = signs[l+0];
+                const short s2 = signs[l+2];
+
+                const float4 v1a = float4(as_type<uchar4>(g1.x)) * select(float4( 1.f), float4(-1.f), bool4(s1 & 1,  s1 & 2,  s1 & 4,   s1 & 8));
+                const float4 v1b = float4(as_type<uchar4>(g1.y)) * select(float4( 1.f), float4(-1.f), bool4(s1 & 16, s1 & 32, s1 & 64,  s1 & 128));
+                const float4 v2a = float4(as_type<uchar4>(g2.x)) * select(float4( 1.f), float4(-1.f), bool4(s2 & 1,  s2 & 2,  s2 & 4,   s2 & 8));
+                const float4 v2b = float4(as_type<uchar4>(g2.y)) * select(float4( 1.f), float4(-1.f), bool4(s2 & 16, s2 & 32, s2 & 64,  s2 & 128));
+
+                sum[0] += dot(yl4[2*l + 0], v1a) + dot(yl4[2*l + 1], v1b);
+                sum[1] += dot(yl4[2*l + 4], v2a) + dot(yl4[2*l + 5], v2b);
             }
             sumf[row] += d1 * sum[0] + d2 * sum[1];
 
