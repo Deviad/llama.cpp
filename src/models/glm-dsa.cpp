@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <set>
 
 #include "llama-kv-cache.h"
@@ -354,18 +356,62 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
                 indexer_q = ggml_view_4d(ctx0, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream, indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
                 indexer_weights = ggml_view_4d(ctx0, indexer_weights, indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2], n_stream, indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
 
-                // calculate indexer kq
-                indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
-                cb(indexer_q, "indexer_q", il);
-                indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
-                cb(indexer_k, "indexer_k", il);
+                // calculate indexer kq — Story 7.T AC2b: heads as matmul columns
+                // for SINGLE-TOKEN decode. The indexer K cache is shared by all
+                // n_indexer_head heads; the broadcast formulation streams the
+                // whole K cache once PER HEAD (32x redundant traffic, ~90
+                // us/layer @4k). Folding heads into the column dim streams K
+                // once (7.8 us/layer; direct 18.7k decode 13.49 -> 15.22 tok/s
+                // with exact BLUE-FALCON retrieval).
+                //
+                // Safe-by-default: this is an opt-in experiment only. The
+                // column fold switches the score matmul to the simdgroup-mm
+                // kernel, whose different FP accumulation order perturbs
+                // near-tie indexer scores. Direct T=1 was gate-verified exact
+                // in isolation, but enabling the fast path in an MTP server run
+                // still deterministically flipped BLUE-FALCON to -021. The
+                // cparams.embeddings_nextn guard was not sufficient to identify
+                // every quality-relevant speculative target call, so the
+                // default path stays on the original broadcast formulation.
+                ggml_tensor * indexer_kq;
+                const int64_t n_tok_str = indexer_q->ne[2]; // tokens per stream
+                static const bool indexer_cols = [] {
+                    const char * s = std::getenv("LLAMA_GLM_DSA_INDEXER_COLS");
+                    return s != nullptr && std::strcmp(s, "0") != 0;
+                }();
+                if (indexer_cols && n_tok_str == 1 && !cparams.embeddings_nextn) {
+                    ggml_tensor * indexer_q2 = ggml_reshape_4d(ctx0, indexer_q,
+                            indexer_q->ne[0], indexer_q->ne[1]*n_tok_str, 1, n_stream);
+                    cb(indexer_q2, "indexer_q", il);
+                    indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
+                    cb(indexer_k, "indexer_k", il);
 
-                ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
-                cb(indexer_kq, "indexer_kq", il);
+                    // [n_kv, n_indexer_head*n_tok_str, 1, n_stream]
+                    indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q2);
+                    cb(indexer_kq, "indexer_kq", il);
 
-                // ReLU requires contiguous tensors
-                indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
-                cb(indexer_kq, "indexer_kq", il);
+                    // split columns back into (heads, tokens): [n_kv, n_head, T, S]
+                    indexer_kq = ggml_view_4d(ctx0, indexer_kq,
+                            indexer_kq->ne[0], n_indexer_head, n_tok_str, n_stream,
+                            indexer_kq->nb[1], indexer_kq->nb[1]*n_indexer_head, indexer_kq->nb[3], 0);
+
+                    // ReLU requires contiguous tensors; restore [n_head, T, n_kv, S]
+                    indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 0, 1, 3));
+                    cb(indexer_kq, "indexer_kq", il);
+                } else {
+                    // original broadcast formulation (frozen for T>1 / verify batches)
+                    ggml_tensor * indexer_q_b = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
+                    cb(indexer_q_b, "indexer_q", il);
+                    indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
+                    cb(indexer_k, "indexer_k", il);
+
+                    indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q_b);
+                    cb(indexer_kq, "indexer_kq", il);
+
+                    // ReLU requires contiguous tensors
+                    indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
+                    cb(indexer_kq, "indexer_kq", il);
+                }
 
                 // apply ReLU
                 ggml_tensor * indexer_score = ggml_relu(ctx0, indexer_kq);
