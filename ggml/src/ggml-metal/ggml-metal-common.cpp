@@ -3,6 +3,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <cstdlib>
 #include <vector>
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
@@ -382,6 +383,9 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
     std::vector<node_info> nodes;
     nodes.reserve(gf->n_nodes);
 
+    const char * mul_mat_id_mul_fusion_env = getenv("GGML_METAL_MUL_MAT_ID_MUL_FUSION");
+    const bool mul_mat_id_mul_fusion = mul_mat_id_mul_fusion_env && atoi(mul_mat_id_mul_fusion_env) != 0;
+
     // fuse nodes:
     // we don't want to make reorders that break fusing, so we first pack all fusable tensors
     //   and perform the reorder over the fused nodes. after the reorder is done, we unfuse
@@ -395,21 +399,29 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
         // can be expanded when needed
         if (node.op() == GGML_OP_ADD ||
             node.op() == GGML_OP_NORM ||
-            node.op() == GGML_OP_RMS_NORM) {
+            node.op() == GGML_OP_RMS_NORM ||
+            (mul_mat_id_mul_fusion && node.op() == GGML_OP_MUL_MAT_ID)) {
             ops[0] = node.op();
 
             int f = i + 1;
-            while (f < n && f < i + MAX_FUSE) {
-                // conservatively allow fusing only these ops
-                // can be expanded when needed
-                if (gf->nodes[f]->op != GGML_OP_ADD &&
-                    gf->nodes[f]->op != GGML_OP_MUL &&
-                    gf->nodes[f]->op != GGML_OP_NORM &&
-                    gf->nodes[f]->op != GGML_OP_RMS_NORM) {
-                    break;
+            if (node.op() == GGML_OP_MUL_MAT_ID) {
+                if (f < n && gf->nodes[f]->op == GGML_OP_MUL) {
+                    ops[1] = GGML_OP_MUL;
+                    f++;
                 }
-                ops[f - i] = gf->nodes[f]->op;
-                f++;
+            } else {
+                while (f < n && f < i + MAX_FUSE) {
+                    // conservatively allow fusing only these ops
+                    // can be expanded when needed
+                    if (gf->nodes[f]->op != GGML_OP_ADD &&
+                        gf->nodes[f]->op != GGML_OP_MUL &&
+                        gf->nodes[f]->op != GGML_OP_NORM &&
+                        gf->nodes[f]->op != GGML_OP_RMS_NORM) {
+                        break;
+                    }
+                    ops[f - i] = gf->nodes[f]->op;
+                    f++;
+                }
             }
 
             f -= i;

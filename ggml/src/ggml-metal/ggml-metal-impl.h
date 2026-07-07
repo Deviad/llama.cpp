@@ -521,6 +521,9 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    int32_t  fused_mul;
+    uint64_t fnb1;
+    uint64_t fnb2;
 } ggml_metal_kargs_mul_mm_id;
 
 typedef struct {
@@ -544,6 +547,11 @@ typedef struct {
     int32_t  ne1;
     uint64_t nb1;
     int32_t  nr0;
+    int32_t  nsg;
+    int32_t  fused_mul;
+    int32_t  fused_mul_grouped_rows;
+    uint64_t fnb1;
+    uint64_t fnb2;
 } ggml_metal_kargs_mul_mv_id;
 
 // NORM

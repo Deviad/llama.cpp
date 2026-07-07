@@ -10152,6 +10152,7 @@ kernel void kernel_mul_mm_id(
         device const char * htpe,
         device const char * hids,
         device       char * dst,
+        device const char * fused_mul,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -10437,14 +10438,16 @@ kernel void kernel_mul_mm_id(
         threadgroup float  * C  = (threadgroup float  *) shmem + j*NR0;
         threadgroup float4 * C4 = (threadgroup float4 *) C;
 
+        const float scale = args.fused_mul ? *((device const float *) (fused_mul + ide*args.fnb1 + idt*args.fnb2)) : 1.0f;
+
         int i = tiisg;
         for (; i < nr0/4; i += 32) {
-            *(D4 + i) = *(C4 + i);
+            *(D4 + i) = *(C4 + i)*scale;
         }
 
         i = (4*(nr0/4)) + tiisg;
         for (; i < nr0; i += 32) {
-            *(D + i) = *(C + i);
+            *(D + i) = *(C + i)*scale;
         }
     }
 }
@@ -10691,6 +10694,7 @@ kernel void kernel_mul_mv_id(
         device const char * src1,
         device       char * dst,
         device const char * ids,
+        device const char * fused_mul,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -10746,6 +10750,21 @@ kernel void kernel_mul_mv_id(
         tiitg,
         tiisg,
         sgitg);
+
+    if (args.fused_mul) {
+        const int first_row = args.fused_mul_grouped_rows ? (tgpig.x*args.nsg + sgitg)*args.nr0 : tgpig.x*args.nr0;
+        const float scale = *((device const float *) (fused_mul + i1*args.fnb1 + i2*args.fnb2));
+
+        threadgroup_barrier(mem_flags::mem_device);
+
+        const int row_thread = args.fused_mul_grouped_rows ? tiisg : tiitg;
+        const int row_step   = args.fused_mul_grouped_rows ? 32    : 32*args.nsg;
+
+        device float * dst_f32 = (device float *) dst_cur;
+        for (int row = first_row + row_thread; row < first_row + args.nr0 && row < args.ne01; row += row_step) {
+            dst_f32[row] *= scale;
+        }
+    }
 }
 
 typedef decltype(kernel_mul_mv_id<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>) kernel_mul_mv_id_t;
