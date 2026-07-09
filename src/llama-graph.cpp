@@ -2662,6 +2662,10 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t v = (int64_t) atoll(s);
         return v < 1 ? (int64_t) 1 : v;
     }();
+    static const bool sparse_verify_batched = sparse_verify && [] {
+        const char * s = getenv("LLAMA_DSA_SPARSE_VERIFY_BATCHED");
+        return s != nullptr && strcmp(s, "0") != 0;
+    }();
     if (sparse_verify && n_tokens > 1 && n_tokens <= sparse_verify_max) {
         ggml_tensor * k = mctx_cur->get_k(ctx0, il);
         // same layout assumptions as the single-token path: MQA n_head_kv=1,
@@ -2679,6 +2683,47 @@ ggml_tensor * llm_graph_context::build_attn(
             n_kv_gate > n_top_k_gate + n_tokens) {
             const int64_t n_kv    = k->ne[2];
             const int64_t n_top_k = top_k->ne[0];
+
+            if (sparse_verify_batched && kq_b == nullptr) {
+                // Batched sparse verify: every token gathers n_top_k because the
+                // gate above requires n_kv > n_top_k + n_tokens. Sort each
+                // token's top_k column into ascending cache order exactly like
+                // the scalar loop below, then flatten the sorted columns and
+                // gather all selected rows from the same 2D K cache view. The
+                // attention call uses one stream per verify token, preserving
+                // per-token softmax/KQV isolation.
+                ggml_tensor * idx_f32  = ggml_cast(ctx0, top_k, GGML_TYPE_F32);
+                ggml_tensor * idx_perm = ggml_argsort(ctx0, idx_f32, GGML_SORT_ORDER_ASC); // [n_top_k, n_tokens]
+
+                ggml_tensor * idx_src = ggml_reshape_3d(ctx0, top_k, 1, n_top_k, n_tokens);
+                ggml_tensor * idx_sorted = ggml_get_rows(ctx0, idx_src, idx_perm); // [1, n_top_k, n_tokens]
+                idx_sorted = ggml_reshape_2d(ctx0, idx_sorted, n_top_k, n_tokens);
+                cb(idx_sorted, "top_k_sparse_verify_sorted_batched", il);
+
+                ggml_tensor * idx_flat = ggml_reshape_1d(ctx0, idx_sorted, n_top_k*n_tokens);
+                ggml_tensor * k_2d_batched = ggml_view_2d(ctx0, k, k->ne[0], n_kv, k->nb[2], 0); // [d, n_kv]
+                ggml_tensor * k_g2d = ggml_get_rows(ctx0, k_2d_batched, idx_flat);              // [d, n_top_k*n_tokens]
+                ggml_tensor * k_g   = ggml_reshape_4d(ctx0, k_g2d, k->ne[0], 1, n_top_k, n_tokens);
+                k_g = ggml_cpy(ctx0, k_g, ggml_new_tensor_4d(ctx0, k->type,
+                                k_g->ne[0], k_g->ne[1], k_g->ne[2], k_g->ne[3]));
+                cb(k_g, "k_gathered_verify_batched", il);
+
+                ggml_tensor * v_g = ggml_view_4d(ctx0, k_g, v_cur->ne[0],
+                                                 k_g->ne[1], k_g->ne[2], k_g->ne[3],
+                                                 k_g->nb[1], k_g->nb[2], k_g->nb[3], 0);
+                cb(v_g, "v_gathered_verify_batched", il);
+
+                ggml_tensor * cur = build_attn_mha(q_cur, k_g, v_g, nullptr, nullptr, sinks, v_mla, kq_scale, il);
+                cb(cur, "kqv_out_sparse_verify_batched", il);
+
+                if (wo) {
+                    cur = build_lora_mm(wo, cur, wo_s);
+                }
+                if (wo_b) {
+                    cur = ggml_add(ctx0, cur, wo_b);
+                }
+                return cur;
+            }
 
             ggml_tensor * k_2d = ggml_view_2d(ctx0, k, k->ne[0], n_kv, k->nb[2], 0); // [d, n_kv]
 
