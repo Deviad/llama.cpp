@@ -2664,7 +2664,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }();
     static const bool sparse_verify_batched = sparse_verify && [] {
         const char * s = getenv("LLAMA_DSA_SPARSE_VERIFY_BATCHED");
-        return s != nullptr && strcmp(s, "0") != 0;
+        return s == nullptr || strcmp(s, "0") != 0;
     }();
     if (sparse_verify && n_tokens > 1 && n_tokens <= sparse_verify_max) {
         ggml_tensor * k = mctx_cur->get_k(ctx0, il);
