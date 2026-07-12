@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
@@ -384,7 +385,8 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
     nodes.reserve(gf->n_nodes);
 
     const char * mul_mat_id_mul_fusion_env = getenv("GGML_METAL_MUL_MAT_ID_MUL_FUSION");
-    const bool mul_mat_id_mul_fusion = mul_mat_id_mul_fusion_env && atoi(mul_mat_id_mul_fusion_env) != 0;
+    const bool mul_mat_id_mul_fusion_global = mul_mat_id_mul_fusion_env && atoi(mul_mat_id_mul_fusion_env) != 0;
+    const bool mul_mat_id_mul_fusion_disabled = mul_mat_id_mul_fusion_env && atoi(mul_mat_id_mul_fusion_env) == 0;
 
     // fuse nodes:
     // we don't want to make reorders that break fusing, so we first pack all fusable tensors
@@ -395,12 +397,20 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
             /*.fused =*/ {},
         };
 
+        const bool scoped_mul_mat_id_mul_fusion =
+            !mul_mat_id_mul_fusion_disabled &&
+            node.op() == GGML_OP_MUL_MAT_ID &&
+            node.node->src[0] != nullptr &&
+            node.node->src[0]->type == GGML_TYPE_Q2_K &&
+            strncmp(node.node->name, "ffn_moe_down-", 13) == 0;
+        const bool fuse_mul_mat_id_mul = mul_mat_id_mul_fusion_global || scoped_mul_mat_id_mul_fusion;
+
         // fuse only ops that start with these operations
         // can be expanded when needed
         if (node.op() == GGML_OP_ADD ||
             node.op() == GGML_OP_NORM ||
             node.op() == GGML_OP_RMS_NORM ||
-            (mul_mat_id_mul_fusion && node.op() == GGML_OP_MUL_MAT_ID)) {
+            (fuse_mul_mat_id_mul && node.op() == GGML_OP_MUL_MAT_ID)) {
             ops[0] = node.op();
 
             int f = i + 1;

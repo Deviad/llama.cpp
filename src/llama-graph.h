@@ -1058,6 +1058,7 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
             ggml_tensor * top_k, // [n_indexer_top_k, n_tokens]
+            ggml_tensor ** dense_mask_cache,
                   float   kq_scale,
                     int   il) const;
 

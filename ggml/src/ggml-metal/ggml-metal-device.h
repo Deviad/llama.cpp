@@ -75,6 +75,24 @@ typedef struct ggml_metal_encoder * ggml_metal_encoder_t;
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent);
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder);
 
+bool ggml_metal_encoder_profile_init(
+        ggml_metal_encoder_t encoder,
+        const char * path,
+        uintptr_t context_id,
+        int compute_sequence,
+        int command_buffer,
+        int graph_start,
+        int graph_end,
+        size_t sample_count);
+void ggml_metal_encoder_profile_begin(ggml_metal_encoder_t encoder);
+void ggml_metal_encoder_profile_sample(
+        ggml_metal_encoder_t encoder,
+        int graph_node,
+        const char * op,
+        const char * name,
+        int fused_nodes,
+        const int64_t ne[4]);
+
 void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const char * name);
 void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder);
 
@@ -133,6 +151,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q6_k_n2    (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);

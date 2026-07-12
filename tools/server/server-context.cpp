@@ -2677,10 +2677,16 @@ private:
             slot.n_draft_total += draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-            const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+            const bool restore_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+            const bool use_ckpt_dft = ctx_dft && (
+                restore_ckpt_dft ||
+               (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft.get())));
+            const bool retain_draft_prefix = ctx_dft && !use_ckpt_dft &&
+                common_speculative_can_reuse_draft_prefix(spec.get(), slot.id);
+            common_speculative_set_draft_prefix_retained(spec.get(), slot.id, retain_draft_prefix);
 
-            if (ctx_dft) {
-                if (use_ckpt_dft) {
+            if (ctx_dft && !retain_draft_prefix) {
+                if (restore_ckpt_dft) {
                     ckpt.load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
@@ -2691,9 +2697,6 @@ private:
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
-
-                const bool use_ckpt_dft =
-                   (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft.get()));
 
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();

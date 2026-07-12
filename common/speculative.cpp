@@ -170,6 +170,9 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
+    virtual bool can_reuse_draft_prefix(llama_seq_id /*seq_id*/) const { return false; }
+    virtual void set_draft_prefix_retained(llama_seq_id /*seq_id*/, bool /*retained*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -925,6 +928,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // pre-advancement before process() mirrored the verify batch.
     std::vector<uint16_t> last_n_drafted;
 
+    bool tail_reuse_enabled = [] {
+        const char * value = getenv("LLAMA_GLM_DSA_MTP_TAIL_REUSE");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    std::vector<bool> draft_prefix_eligible;
+    std::vector<bool> draft_prefix_retained;
+
     // Story 7.S AC5 — opt-in phase profiling (LLAMA_SPEC_MTP_PROFILE=1).
     // Accumulates wall time per draft-side phase to identify whether the
     // ~100+ ms/cycle draft cost is catch-up decode, draft decode, or
@@ -1022,6 +1032,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows.assign(n_seq, 0);
 
         last_n_drafted.assign(n_seq, 0);
+        draft_prefix_eligible.assign(n_seq, false);
+        draft_prefix_retained.assign(n_seq, false);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1098,48 +1110,75 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int64_t prof_t0 = prof_enabled ? ggml_time_us() : 0;
 
+        bool has_retained_prefix = false;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            has_retained_prefix = has_retained_prefix ||
+                (i_batch_beg[seq_id] >= 0 && draft_prefix_retained[seq_id]);
+        }
+
+        int32_t n_catchup_tokens = n_tokens;
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
+            if (has_retained_prefix) {
+                for (int k = 0; k < n_tokens; ++k) {
+                    const llama_seq_id seq_id = batch_in.seq_id[k][0];
+                    if (draft_prefix_retained[seq_id] && k == i_batch_beg[seq_id]) {
+                        continue;
+                    }
 
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
-            {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { seq_id }, 0);
 
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
+                    const float * h_row = k == i_batch_beg[seq_id]
+                        ? pending_h[seq_id].data()
+                        : llama_get_embeddings_nextn_ith(ctx_tgt, k - 1);
+                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                }
+            } else {
+                for (int k = 0; k < n_tokens; ++k) {
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                // shift the tgt embeddings to the right by one position
+                // assumes that the tokens in the batch are sequential for each sequence
+                // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+                //                                                       ^--- this is a problem
+                // TODO:this is generally true, but would be nice to assert it
+                {
+                    const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                }
+
+                // fill the pending embeddings from a previous run
+                auto set_h = [&](int idx, const float * h_row) {
+                    std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+                };
+
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+
+                    set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                }
             }
 
-            const int32_t rc = llama_decode(ctx_dft, batch);
-            if (rc != 0) {
-                LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
-                return false;
+            n_catchup_tokens = batch.n_tokens;
+            if (batch.n_tokens > 0) {
+                const int32_t rc = llama_decode(ctx_dft, batch);
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
+                    return false;
+                }
             }
         }
 
         const int64_t prof_t1 = prof_enabled ? ggml_time_us() : 0;
         if (prof_enabled) {
             prof_t_catchup += prof_t1 - prof_t0;
-            prof_n_catchup_tokens += n_tokens;
+            prof_n_catchup_tokens += has_retained_prefix ? n_catchup_tokens : n_tokens;
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1158,6 +1197,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+
+            draft_prefix_eligible[seq_id] = false;
+            draft_prefix_retained[seq_id] = false;
         }
 
         if (prof_enabled) {
@@ -1171,6 +1213,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
+        std::fill(draft_prefix_eligible.begin(), draft_prefix_eligible.end(), false);
+        std::fill(draft_prefix_retained.begin(), draft_prefix_retained.end(), false);
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
@@ -1304,6 +1348,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             last_n_drafted[seq_id] = (uint16_t) dp.result->size();
+            draft_prefix_eligible[seq_id] = tail_reuse_enabled && params.n_max == 1 &&
+                !is_mem_shared && dp.result->size() == 1;
         }
     }
 
@@ -1328,6 +1374,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     bool need_embd_nextn() const override {
         return true;
+    }
+
+    bool can_reuse_draft_prefix(llama_seq_id seq_id) const override {
+        return seq_id >= 0 && seq_id < (llama_seq_id) draft_prefix_eligible.size() &&
+            draft_prefix_eligible[seq_id];
+    }
+
+    void set_draft_prefix_retained(llama_seq_id seq_id, bool retained) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) draft_prefix_retained.size()) {
+            return;
+        }
+        draft_prefix_retained[seq_id] = retained && draft_prefix_eligible[seq_id];
     }
 };
 
@@ -2108,6 +2166,26 @@ bool common_speculative_need_embd_nextn(common_speculative * spec) {
     }
 
     return false;
+}
+
+bool common_speculative_can_reuse_draft_prefix(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_last.size()) {
+        return false;
+    }
+
+    const common_speculative_impl * impl = spec->impl_last[seq_id];
+    return impl != nullptr && impl->can_reuse_draft_prefix(seq_id);
+}
+
+void common_speculative_set_draft_prefix_retained(common_speculative * spec, llama_seq_id seq_id, bool retained) {
+    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_last.size()) {
+        return;
+    }
+
+    common_speculative_impl * impl = spec->impl_last[seq_id];
+    if (impl != nullptr) {
+        impl->set_draft_prefix_retained(seq_id, retained);
+    }
 }
 
 void common_speculative_draft(common_speculative * spec) {

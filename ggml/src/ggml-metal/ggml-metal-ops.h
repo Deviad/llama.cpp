@@ -17,6 +17,11 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_fusion,
         bool use_concurrency,
         bool use_capture,
+        bool use_profile,
+        const char * profile_path,
+        uintptr_t profile_context_id,
+        int profile_compute_sequence,
+        int profile_command_buffer,
         int  debug_graph,
         int  debug_fusion);
 

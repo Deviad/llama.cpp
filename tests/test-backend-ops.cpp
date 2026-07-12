@@ -3039,6 +3039,7 @@ struct test_bin_bcast : public test_case {
     int nf; // number of fused ops, nf == 1 -> single op (no fusion)
     bool perm1; // permute src1?
     bool src_overlap; // src0 and src1 are overlapping views of the same buffer
+    const char * output_name;
 
     bool run_whole_graph() override { return nf > 1; }
 
@@ -3054,8 +3055,9 @@ struct test_bin_bcast : public test_case {
             std::array<int64_t, 4> ne = {10, 10, 1, 1},
             std::array<int, 4> nr = {1, 2, 1, 1},
             int nf = 1,
-            bool perm1 = false, bool src_overlap = false)
-        : op(op), type(type), ne(ne), nr(nr), nf(nf), perm1(perm1), src_overlap(src_overlap) {}
+            bool perm1 = false, bool src_overlap = false,
+            const char * output_name = "out")
+        : op(op), type(type), ne(ne), nr(nr), nf(nf), perm1(perm1), src_overlap(src_overlap), output_name(output_name) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         GGML_ASSERT(nf <= 16);
@@ -3097,7 +3099,7 @@ struct test_bin_bcast : public test_case {
             out = op(ctx, out, b[i]);
         }
 
-        ggml_set_name(out, "out");
+        ggml_set_name(out, output_name);
 
         return out;
     }
@@ -8253,6 +8255,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         //add_test_bin_bcast(type, {3, 3, 2560, 1280}, {2, 1, 1, 1});
     }
 
+    test_cases.emplace_back(new test_bin_bcast(
+        ggml_add, GGML_TYPE_F16, {64, 4, 1, 1}, {1, 1, 1, 1}, 1, false, false, "attn_kq_mask_dsa-test"));
+    test_cases.emplace_back(new test_bin_bcast(
+        ggml_add, GGML_TYPE_F16, {63, 4, 1, 1}, {1, 1, 1, 1}, 1, false, false, "attn_kq_mask_dsa-test"));
+
     // single inplace tests, especially important for WebGPU backend since kernels for inplace vs. not are different
     test_cases.emplace_back(new test_bin_bcast(ggml_add_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
     test_cases.emplace_back(new test_bin_bcast(ggml_mul_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
@@ -8578,7 +8585,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
-
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4, 8}) {

@@ -458,12 +458,27 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+    id<MTLCommandBuffer> cmd_buf;
+
+    id<MTLCounterSampleBuffer> profile_samples;
+    NSMutableArray * profile_records;
+    NSString * profile_path;
+    NSUInteger profile_sample_index;
+    uintptr_t profile_context_id;
+    int profile_compute_sequence;
+    int profile_command_buffer;
+    int profile_graph_start;
+    int profile_graph_end;
+    bool cmd_buf_retained;
+    bool concurrent;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+    res->cmd_buf = cmd_buf;
+    res->concurrent = concurrent;
 
     if (concurrent) {
         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
@@ -477,8 +492,159 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
 }
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
+    [encoder->profile_samples release];
+    [encoder->profile_records release];
+    [encoder->profile_path release];
+    if (encoder->cmd_buf_retained) {
+        [encoder->cmd_buf release];
+    }
     [encoder->obj release];
     free(encoder);
+}
+
+bool ggml_metal_encoder_profile_init(
+        ggml_metal_encoder_t encoder,
+        const char * path,
+        uintptr_t context_id,
+        int compute_sequence,
+        int command_buffer,
+        int graph_start,
+        int graph_end,
+        size_t sample_count) {
+    if (!path || path[0] == '\0' || sample_count < 2) {
+        return false;
+    }
+
+    id<MTLDevice> device = encoder->cmd_buf.commandQueue.device;
+    if (![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        GGML_LOG_WARN("%s: stage-boundary counter sampling is unavailable\n", __func__);
+        return false;
+    }
+
+    id<MTLCounterSet> timestamp_set = nil;
+    for (id<MTLCounterSet> counter_set in device.counterSets) {
+        if ([counter_set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+            timestamp_set = counter_set;
+            break;
+        }
+    }
+    if (!timestamp_set) {
+        GGML_LOG_WARN("%s: timestamp counter set is unavailable\n", __func__);
+        return false;
+    }
+
+    MTLCounterSampleBufferDescriptor * descriptor = [[MTLCounterSampleBufferDescriptor alloc] init];
+    descriptor.counterSet = timestamp_set;
+    descriptor.label = @"ggml-metal-op-profile";
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.sampleCount = sample_count;
+
+    NSError * error = nil;
+    encoder->profile_samples = [device newCounterSampleBufferWithDescriptor:descriptor error:&error];
+    [descriptor release];
+    if (!encoder->profile_samples) {
+        GGML_LOG_WARN("%s: failed to create timestamp sample buffer: %s\n", __func__,
+                error ? error.localizedDescription.UTF8String : "unknown error");
+        return false;
+    }
+
+    encoder->profile_path = [[NSString alloc] initWithUTF8String:path];
+    if (!encoder->profile_path) {
+        GGML_LOG_WARN("%s: invalid UTF-8 profile path\n", __func__);
+        [encoder->profile_samples release];
+        encoder->profile_samples = nil;
+        return false;
+    }
+    NSFileManager * manager = [NSFileManager defaultManager];
+    if (![manager fileExistsAtPath:encoder->profile_path] &&
+        ![manager createFileAtPath:encoder->profile_path contents:nil attributes:nil]) {
+        GGML_LOG_WARN("%s: cannot create profile output: %s\n", __func__, path);
+        [encoder->profile_samples release];
+        [encoder->profile_path release];
+        encoder->profile_samples = nil;
+        encoder->profile_path = nil;
+        return false;
+    }
+    NSFileHandle * file = [NSFileHandle fileHandleForWritingAtPath:encoder->profile_path];
+    if (!file) {
+        GGML_LOG_WARN("%s: cannot open profile output: %s\n", __func__, path);
+        [encoder->profile_samples release];
+        [encoder->profile_path release];
+        encoder->profile_samples = nil;
+        encoder->profile_path = nil;
+        return false;
+    }
+    [file closeFile];
+
+    encoder->profile_records = [[NSMutableArray alloc] initWithCapacity:sample_count - 1];
+    [encoder->cmd_buf retain];
+    encoder->cmd_buf_retained = true;
+    encoder->profile_sample_index = 0;
+    encoder->profile_context_id = context_id;
+    encoder->profile_compute_sequence = compute_sequence;
+    encoder->profile_command_buffer = command_buffer;
+    encoder->profile_graph_start = graph_start;
+    encoder->profile_graph_end = graph_end;
+
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+    encoder->obj = nil;
+
+    GGML_LOG_DEBUG("%s: enabled context=0x%llx compute=%d command_buffer=%d graph=[%d,%d) samples=%zu\n", __func__,
+            (unsigned long long) context_id, compute_sequence, command_buffer, graph_start, graph_end, sample_count);
+    return true;
+}
+
+void ggml_metal_encoder_profile_begin(ggml_metal_encoder_t encoder) {
+    if (!encoder->profile_samples) {
+        return;
+    }
+    if (encoder->obj || encoder->profile_sample_index + 2 > encoder->profile_samples.sampleCount) {
+        GGML_ABORT("invalid Metal profile encoder state");
+    }
+
+    const NSUInteger start_index = encoder->profile_sample_index++;
+    const NSUInteger end_index = encoder->profile_sample_index++;
+    MTLComputePassDescriptor * descriptor = [MTLComputePassDescriptor computePassDescriptor];
+    descriptor.dispatchType = encoder->concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+    MTLComputePassSampleBufferAttachmentDescriptor * attachment = descriptor.sampleBufferAttachments[0];
+    attachment.sampleBuffer = encoder->profile_samples;
+    attachment.startOfEncoderSampleIndex = start_index;
+    attachment.endOfEncoderSampleIndex = end_index;
+
+    encoder->obj = [encoder->cmd_buf computeCommandEncoderWithDescriptor:descriptor];
+    [encoder->obj retain];
+}
+
+void ggml_metal_encoder_profile_sample(
+        ggml_metal_encoder_t encoder,
+        int graph_node,
+        const char * op,
+        const char * name,
+        int fused_nodes,
+        const int64_t ne[4]) {
+    if (!encoder->profile_samples) {
+        return;
+    }
+    if (!encoder->obj || encoder->profile_sample_index < 2) {
+        GGML_ABORT("invalid Metal profile sample state");
+    }
+
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+    encoder->obj = nil;
+
+    NSString * op_string = op ? [NSString stringWithUTF8String:op] : @"";
+    NSString * name_string = name ? [NSString stringWithUTF8String:name] : @"";
+    [encoder->profile_records addObject:@{
+        @"sample_start": @(encoder->profile_sample_index - 2),
+        @"sample_end": @(encoder->profile_sample_index - 1),
+        @"graph_node": @(graph_node),
+        @"op": op_string,
+        @"name": name_string,
+        @"fused_nodes": @(fused_nodes),
+        @"ne": @[@(ne[0]), @(ne[1]), @(ne[2]), @(ne[3])],
+    }];
 }
 
 void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const char * name) {
@@ -515,6 +681,134 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
+
+    if (!encoder->profile_samples || encoder->profile_sample_index < 2) {
+        return;
+    }
+
+    id<MTLCounterSampleBuffer> samples = [encoder->profile_samples retain];
+    NSArray * records = [encoder->profile_records copy];
+    NSString * path = [encoder->profile_path copy];
+    const NSUInteger sample_count = encoder->profile_sample_index;
+    const uintptr_t context_id = encoder->profile_context_id;
+    const int compute_sequence = encoder->profile_compute_sequence;
+    const int command_buffer = encoder->profile_command_buffer;
+    const int graph_start = encoder->profile_graph_start;
+    const int graph_end = encoder->profile_graph_end;
+
+    [encoder->cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> command) {
+        @autoreleasepool {
+        if (command.status != MTLCommandBufferStatusCompleted) {
+            GGML_LOG_WARN("%s: profiled command buffer failed: %s\n", __func__,
+                    command.error ? command.error.localizedDescription.UTF8String : "unknown error");
+            return;
+        }
+
+        NSData * data = [samples resolveCounterRange:NSMakeRange(0, sample_count)];
+        if (!data || data.length < sample_count * sizeof(MTLCounterResultTimestamp)) {
+            GGML_LOG_WARN("%s: failed to resolve timestamp samples\n", __func__);
+            return;
+        }
+
+        const MTLCounterResultTimestamp * timestamps = data.bytes;
+        for (NSUInteger i = 0; i < sample_count; ++i) {
+            if (timestamps[i].timestamp == MTLCounterErrorValue) {
+                GGML_LOG_WARN("%s: timestamp sample %lu is invalid\n", __func__, (unsigned long) i);
+                return;
+            }
+        }
+        const uint64_t first = timestamps[0].timestamp;
+        const uint64_t last = timestamps[sample_count - 1].timestamp;
+        const uint64_t raw_span = last >= first ? last - first : 0;
+        const double gpu_duration_ns = MAX(0.0, command.GPUEndTime - command.GPUStartTime) * 1.0e9;
+        const double measured_ns_per_tick = raw_span > 0 && gpu_duration_ns > 0.0 ? gpu_duration_ns / raw_span : 1.0;
+        const bool calibration_valid = measured_ns_per_tick >= 0.5 && measured_ns_per_tick <= 2.0;
+        const double ns_per_tick = calibration_valid ? measured_ns_per_tick : 1.0;
+
+        NSMutableString * output = [NSMutableString string];
+        for (NSDictionary * record in records) {
+            const NSUInteger start_index = [record[@"sample_start"] unsignedIntegerValue];
+            const NSUInteger end_index = [record[@"sample_end"] unsignedIntegerValue];
+            if (start_index >= end_index || end_index >= sample_count) {
+                continue;
+            }
+            const uint64_t before = timestamps[start_index].timestamp;
+            const uint64_t after = timestamps[end_index].timestamp;
+            const uint64_t delta = after >= before ? after - before : 0;
+            NSMutableDictionary * row = [record mutableCopy];
+            row[@"schema"] = @"ggml_metal_op_profile.v1";
+            row[@"record_type"] = @"op";
+            row[@"context_id"] = [NSString stringWithFormat:@"0x%llx", (unsigned long long) context_id];
+            row[@"compute_sequence"] = @(compute_sequence);
+            row[@"command_buffer"] = @(command_buffer);
+            row[@"graph_start"] = @(graph_start);
+            row[@"graph_end"] = @(graph_end);
+            row[@"raw_ticks"] = @(delta);
+            row[@"duration_ns"] = @(delta * ns_per_tick);
+            row[@"ns_per_tick"] = @(ns_per_tick);
+            NSData * json = [NSJSONSerialization dataWithJSONObject:row options:0 error:nil];
+            if (json) {
+                NSString * line = [[[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] autorelease];
+                [output appendString:line];
+                [output appendString:@"\n"];
+            }
+            [row release];
+        }
+
+        NSDictionary * summary = @{
+            @"schema": @"ggml_metal_op_profile.v1",
+            @"record_type": @"command_buffer",
+            @"context_id": [NSString stringWithFormat:@"0x%llx", (unsigned long long) context_id],
+            @"compute_sequence": @(compute_sequence),
+            @"command_buffer": @(command_buffer),
+            @"graph_start": @(graph_start),
+            @"graph_end": @(graph_end),
+            @"sample_count": @(sample_count),
+            @"raw_span_ticks": @(raw_span),
+            @"gpu_duration_ns": @(gpu_duration_ns),
+            @"measured_ns_per_tick": @(measured_ns_per_tick),
+            @"calibration_valid": @(calibration_valid),
+            @"ns_per_tick": @(ns_per_tick),
+        };
+        NSData * summary_json = [NSJSONSerialization dataWithJSONObject:summary options:0 error:nil];
+        if (summary_json) {
+            NSString * line = [[[NSString alloc] initWithData:summary_json encoding:NSUTF8StringEncoding] autorelease];
+            [output appendString:line];
+            [output appendString:@"\n"];
+        }
+
+        static dispatch_queue_t write_queue;
+        static dispatch_once_t once_token;
+        dispatch_once(&once_token, ^{
+            write_queue = dispatch_queue_create("ggml-metal-profile-writer", DISPATCH_QUEUE_SERIAL);
+        });
+        dispatch_sync(write_queue, ^{
+            @try {
+                NSFileManager * manager = [NSFileManager defaultManager];
+                if (![manager fileExistsAtPath:path] &&
+                    ![manager createFileAtPath:path contents:nil attributes:nil]) {
+                    GGML_LOG_WARN("%s: cannot create profile output: %s\n", __func__, path.UTF8String);
+                    return;
+                }
+                NSFileHandle * file = [NSFileHandle fileHandleForWritingAtPath:path];
+                NSData * output_data = [output dataUsingEncoding:NSUTF8StringEncoding];
+                if (!file || !output_data) {
+                    GGML_LOG_WARN("%s: cannot open or encode profile output: %s\n", __func__, path.UTF8String);
+                    return;
+                }
+                [file seekToEndOfFile];
+                [file writeData:output_data];
+                [file closeFile];
+            } @catch (NSException * exception) {
+                GGML_LOG_WARN("%s: profile write failed: %s\n", __func__, exception.reason.UTF8String);
+            }
+        });
+        }
+    }];
+
+    [samples release];
+    [records release];
+    [path release];
 }
 
 struct ggml_metal_device {
@@ -1148,7 +1442,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_DIV:
         case GGML_OP_ADD_ID:
         case GGML_OP_ACC:
-            return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) && op->src[0]->type == GGML_TYPE_F32;
+            if (!ggml_is_contiguous_rows(op->src[0]) || !ggml_is_contiguous_rows(op->src[1])) {
+                return false;
+            }
+            if (op->src[0]->type == GGML_TYPE_F32) {
+                return true;
+            }
+            return op->op == GGML_OP_ADD && op->src[0]->type == GGML_TYPE_F16 &&
+                op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16 &&
+                strncmp(op->name, "attn_kq_mask_dsa-", sizeof("attn_kq_mask_dsa-") - 1) == 0 &&
+                (getenv("LLAMA_DSA_MASK_ADD_OFFLOAD") == NULL ||
+                 strcmp(getenv("LLAMA_DSA_MASK_ADD_OFFLOAD"), "0") != 0);
         case GGML_OP_REPEAT:
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;

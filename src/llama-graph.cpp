@@ -2544,6 +2544,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
         ggml_tensor * top_k,
+        ggml_tensor ** dense_mask_cache,
             float     kq_scale,
             int       il) const {
     // these nodes are added to the graph together so that they are not reordered
@@ -2784,6 +2785,37 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     // ── default: masked-dense attention (frozen baseline, unchanged) ──
+    static const bool full_topk_mask_bypass = [] {
+        const char * value = getenv("LLAMA_DSA_FULL_TOPK_MASK_BYPASS");
+        return value == nullptr || strcmp(value, "0") != 0;
+    }();
+    if (full_topk_mask_bypass && top_k->ne[0] == kq_mask->ne[0]) {
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3],
+                k->nb[1], k->nb[2], k->nb[3], 0);
+        ggml_tensor * cur = build_attn_mha(q_cur, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+        if (wo) {
+            cur = build_lora_mm(wo, cur, wo_s);
+        }
+        if (wo_b) {
+            cur = ggml_add(ctx0, cur, wo_b);
+        }
+        return cur;
+    }
+    if (dense_mask_cache != nullptr && *dense_mask_cache != nullptr) {
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3],
+                k->nb[1], k->nb[2], k->nb[3], 0);
+        ggml_tensor * cur = build_attn_mha(q_cur, k, v, kq_b, *dense_mask_cache, sinks, v_mla, kq_scale, il);
+        if (wo) {
+            cur = build_lora_mm(wo, cur, wo_s);
+        }
+        if (wo_b) {
+            cur = ggml_add(ctx0, cur, wo_b);
+        }
+        return cur;
+    }
+
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
@@ -2809,7 +2841,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
-
+    cb(kq_mask_top_k, "attn_kq_mask_dsa", il);
+    if (dense_mask_cache != nullptr) {
+        *dense_mask_cache = kq_mask_top_k;
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);

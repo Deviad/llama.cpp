@@ -11,6 +11,14 @@
 
 #import <Metal/Metal.h>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <sys/file.h>
+#include <unistd.h>
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -19,8 +27,166 @@
 // max number of MTLCommandBuffer used to submit a graph for processing
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
 
+static _Atomic uint64_t ggml_metal_cb_timing_next_context_id = 1;
+
+static dispatch_queue_t ggml_metal_cb_timing_writer_queue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("ggml-metal-cb-timing-writer", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+static bool ggml_metal_cb_timing_append(NSString * path, NSData * data) {
+    const char * file_path = path.fileSystemRepresentation;
+    if (!file_path) {
+        return false;
+    }
+
+    int fd;
+    do {
+        fd = open(file_path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+        return false;
+    }
+
+    int lock_result;
+    do {
+        lock_result = flock(fd, LOCK_EX);
+    } while (lock_result != 0 && errno == EINTR);
+    if (lock_result != 0) {
+        close(fd);
+        return false;
+    }
+
+    const uint8_t * bytes = data.bytes;
+    size_t remaining = data.length;
+    bool success = true;
+    while (remaining > 0) {
+        const ssize_t written = write(fd, bytes, remaining);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            success = false;
+            break;
+        }
+        bytes += written;
+        remaining -= (size_t) written;
+    }
+
+    while (flock(fd, LOCK_UN) != 0 && errno == EINTR) {
+    }
+    close(fd);
+    return success;
+}
+
+static void ggml_metal_cb_timing_attach(
+        id<MTLCommandBuffer> command_buffer,
+        NSString * path,
+        dispatch_group_t pending,
+        uint64_t context_id,
+        int compute_sequence,
+        int command_buffer_index,
+        int graph_start,
+        int graph_end,
+        int graph_nodes) {
+    NSString * output_path = [path copy];
+    dispatch_group_enter(pending);
+    dispatch_retain(pending);
+
+    bool handler_attached = false;
+    @try {
+    [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> command) {
+        @autoreleasepool {
+            bool write_queued = false;
+            @try {
+                const MTLCommandBufferStatus status = command.status;
+                const double raw_gpu_start_s = command.GPUStartTime;
+                const double raw_gpu_end_s = command.GPUEndTime;
+                const bool timing_valid = status == MTLCommandBufferStatusCompleted &&
+                        isfinite(raw_gpu_start_s) && isfinite(raw_gpu_end_s) &&
+                        raw_gpu_start_s > 0.0 && raw_gpu_end_s > raw_gpu_start_s;
+                const double gpu_start_s = timing_valid ? raw_gpu_start_s : 0.0;
+                const double gpu_end_s = timing_valid ? raw_gpu_end_s : 0.0;
+                const double gpu_duration_ns = timing_valid ? (gpu_end_s - gpu_start_s) * 1.0e9 : 0.0;
+                NSString * error = command.error ? command.error.localizedDescription : @"";
+
+                NSDictionary * row = @{
+                    @"schema": @"ggml_metal_cb_timing.v1",
+                    @"pid": @(getpid()),
+                    @"context_id": @(context_id),
+                    @"compute_sequence": @(compute_sequence),
+                    @"command_buffer": @(command_buffer_index),
+                    @"graph_start": @(graph_start),
+                    @"graph_end": @(graph_end),
+                    @"graph_nodes": @(graph_nodes),
+                    @"status": @((int) status),
+                    @"error": error ?: @"",
+                    @"gpu_start_s": @(gpu_start_s),
+                    @"gpu_end_s": @(gpu_end_s),
+                    @"gpu_duration_ns": @(gpu_duration_ns),
+                    @"timing_valid": @(timing_valid),
+                };
+                NSError * json_error = nil;
+                NSData * json = [NSJSONSerialization dataWithJSONObject:row options:0 error:&json_error];
+                if (!json) {
+                    GGML_LOG_WARN("%s: failed to encode command-buffer timing: %s\n", __func__,
+                            json_error ? json_error.localizedDescription.UTF8String : "unknown error");
+                } else {
+                    NSMutableData * line = [NSMutableData dataWithData:json];
+                    const uint8_t newline = '\n';
+                    [line appendBytes:&newline length:1];
+                    dispatch_async(ggml_metal_cb_timing_writer_queue(), ^{
+                        @autoreleasepool {
+                            @try {
+                                if (!ggml_metal_cb_timing_append(output_path, line)) {
+                                    GGML_LOG_WARN("%s: cannot append command-buffer timing output: %s\n", __func__, output_path.UTF8String);
+                                }
+                            } @catch (NSException * exception) {
+                                GGML_LOG_WARN("%s: command-buffer timing write failed: %s\n", __func__, exception.reason.UTF8String);
+                            } @finally {
+                                dispatch_group_leave(pending);
+                                dispatch_release(pending);
+                            }
+                        }
+                    });
+                    write_queued = true;
+                }
+            } @catch (NSException * exception) {
+                GGML_LOG_WARN("%s: command-buffer timing handler failed: %s\n", __func__, exception.reason.UTF8String);
+            } @finally {
+                if (!write_queued) {
+                    dispatch_group_leave(pending);
+                    dispatch_release(pending);
+                }
+            }
+        }
+    }];
+    handler_attached = true;
+    } @catch (NSException * exception) {
+        GGML_LOG_WARN("%s: failed to attach command-buffer timing handler: %s\n", __func__, exception.reason.UTF8String);
+    }
+    if (!handler_attached) {
+        dispatch_group_leave(pending);
+        dispatch_release(pending);
+    }
+
+    [output_path release];
+}
+
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
+};
+
+struct ggml_metal_cb_timing_metadata {
+    int compute_sequence;
+    int graph_start;
+    int graph_end;
+    int graph_nodes;
+    bool attached;
 };
 
 struct ggml_metal {
@@ -52,6 +218,18 @@ struct ggml_metal {
 
     id<MTLCaptureScope> capture_scope;
 
+    // opt-in timestamp profiling state
+    int profile_compute;
+    int profile_sequence;
+    bool profile_current;
+    const char * profile_path;
+
+    // opt-in production-equivalent command-buffer timing state
+    NSString * cb_timing_path;
+    dispatch_group_t cb_timing_pending;
+    uint64_t cb_timing_context_id;
+    int cb_timing_sequence;
+
     // command buffer state
     int n_cb;           // number of extra threads used to submit the command buffers
     int n_nodes_0;      // number of nodes submitted by the main thread
@@ -65,6 +243,7 @@ struct ggml_metal {
 
     // n_cb command buffers + 1 used by the main thread
     struct ggml_metal_command_buffer cmd_bufs[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
+    struct ggml_metal_cb_timing_metadata cb_timing_metadata[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
 
     // extra command buffers for things like getting, setting and copying tensors
     NSMutableArray * cmd_bufs_ext;
@@ -80,6 +259,25 @@ struct ggml_metal {
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
 };
+
+static void ggml_metal_commit_graph_command_buffer(ggml_metal_t ctx, int command_buffer_index) {
+    id<MTLCommandBuffer> command_buffer = ctx->cmd_bufs[command_buffer_index].obj;
+    struct ggml_metal_cb_timing_metadata * metadata = &ctx->cb_timing_metadata[command_buffer_index];
+    if (ctx->cb_timing_path && !metadata->attached && metadata->graph_end > metadata->graph_start) {
+        ggml_metal_cb_timing_attach(
+            command_buffer,
+            ctx->cb_timing_path,
+            ctx->cb_timing_pending,
+            ctx->cb_timing_context_id,
+            metadata->compute_sequence,
+            command_buffer_index,
+            metadata->graph_start,
+            metadata->graph_end,
+            metadata->graph_nodes);
+        metadata->attached = true;
+    }
+    [command_buffer commit];
+}
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
@@ -169,6 +367,55 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         }
     }
 
+    res->profile_compute = 0;
+    res->profile_sequence = 0;
+    res->profile_current = false;
+    res->profile_path = getenv("GGML_METAL_PROFILE_PATH");
+    {
+        const char * val = getenv("GGML_METAL_PROFILE_COMPUTE");
+        if (val && res->profile_path && res->profile_path[0] != '\0') {
+            res->profile_compute = strcmp(val, "all") == 0 ? -1 : atoi(val);
+        }
+    }
+    if (res->profile_compute != 0) {
+        GGML_LOG_INFO("%s: timestamp profile compute = %d (-1 means all), path = %s\n", __func__,
+                res->profile_compute, res->profile_path);
+    }
+
+    res->cb_timing_path = nil;
+    res->cb_timing_pending = nil;
+    res->cb_timing_context_id = 0;
+    res->cb_timing_sequence = 0;
+    {
+        const char * path = getenv("GGML_METAL_CB_TIMING_PATH");
+        if (path && path[0] != '\0') {
+            NSString * output_path = [[NSString alloc] initWithUTF8String:path];
+            if (!output_path) {
+                GGML_LOG_WARN("%s: invalid UTF-8 command-buffer timing path\n", __func__);
+            } else {
+                const char * file_path = output_path.fileSystemRepresentation;
+                int fd = -1;
+                if (file_path) {
+                    do {
+                        fd = open(file_path, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+                    } while (fd < 0 && errno == EINTR);
+                }
+                if (fd < 0) {
+                    GGML_LOG_WARN("%s: cannot open command-buffer timing output: %s (%s)\n", __func__,
+                            path, strerror(errno));
+                    [output_path release];
+                } else {
+                    close(fd);
+                    res->cb_timing_path = output_path;
+                    res->cb_timing_pending = dispatch_group_create();
+                    res->cb_timing_context_id = atomic_fetch_add(&ggml_metal_cb_timing_next_context_id, 1);
+                    GGML_LOG_INFO("%s: production command-buffer timing enabled, context=%llu, path=%s\n", __func__,
+                            (unsigned long long) res->cb_timing_context_id, path);
+                }
+            }
+        }
+    }
+
     res->has_error = false;
 
     res->gf = nil;
@@ -188,6 +435,15 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+    if (ctx->cb_timing_pending) {
+        const dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC);
+        if (dispatch_group_wait(ctx->cb_timing_pending, deadline) != 0) {
+            GGML_LOG_WARN("%s: timed out waiting for command-buffer timing records; pending handlers retain their state\n", __func__);
+        }
+        dispatch_release(ctx->cb_timing_pending);
+    }
+    [ctx->cb_timing_path release];
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -465,6 +721,17 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         ctx->n_nodes_per_cb = (ctx->n_nodes_1 + ctx->n_cb - 1) / ctx->n_cb;
 
+        ctx->profile_sequence++;
+        if (ctx->cb_timing_path) {
+            ctx->cb_timing_sequence++;
+        }
+        ctx->profile_current = ctx->profile_compute < 0 ||
+                (ctx->profile_compute > 0 && ctx->profile_sequence == ctx->profile_compute);
+        if (ctx->profile_compute > 0 && ctx->profile_sequence <= ctx->profile_compute) {
+            GGML_LOG_INFO("%s: profile candidate context=%p compute=%d nodes=%d selected=%s\n", __func__,
+                    (void *) ctx, ctx->profile_sequence, gf->n_nodes, ctx->profile_current ? "true" : "false");
+        }
+
         if (ctx->capture_compute >= 0) {
             ctx->capture_compute--;
         }
@@ -601,7 +868,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     return GGML_STATUS_ABORTED;
                 }
 
-                [next_buffer commit];
+                ggml_metal_commit_graph_command_buffer(ctx, i + 1);
             }
 
             [ctx->capture_scope endScope];
@@ -661,6 +928,10 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    if (ctx->profile_compute != 0) {
+        n_cb = MAX(n_cb, 3);
+    }
+
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 
@@ -691,6 +962,13 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         }
 
         id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+        ctx->cb_timing_metadata[cb_idx] = (struct ggml_metal_cb_timing_metadata) {
+            /*.compute_sequence =*/ ctx->cb_timing_sequence,
+            /*.graph_start      =*/ idx_start,
+            /*.graph_end        =*/ idx_end,
+            /*.graph_nodes      =*/ ctx->gf->n_nodes,
+            /*.attached         =*/ false,
+        };
 
         ggml_metal_op_t ctx_op = ggml_metal_op_init(
             ctx->dev,
@@ -701,6 +979,11 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->use_fusion,
             ctx->use_concurrency,
             ctx->capture_compute,
+            ctx->profile_current,
+            ctx->profile_path,
+            (uintptr_t) ctx,
+            ctx->profile_sequence,
+            cb_idx,
             ctx->debug_graph,
             ctx->debug_fusion);
 
@@ -716,7 +999,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         ggml_metal_op_free(ctx_op);
 
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
-            [cmd_buf commit];
+            ggml_metal_commit_graph_command_buffer(ctx, cb_idx);
         }
     });
 }

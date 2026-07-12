@@ -945,6 +945,40 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_q6_k_n2(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_TENSOR_LOCALS(int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(int32_t, ne1, op->src[1], ne);
+
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_Q6_K);
+    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(ne11 == 2);
+    GGML_ASSERT(ne12 <= INT16_MAX && ne13 <= INT16_MAX);
+
+    const int nsg = N_SG_Q6_K;
+    const int16_t r2 = (int16_t) (ne12 / ne02);
+    const int16_t r3 = (int16_t) (ne13 / ne03);
+
+    char name[256];
+    snprintf(name, sizeof(name), "kernel_mul_mv_q6_K_f32_n2_nsg=%d_ne12=%d_r2=%d_r3=%d", nsg, ne12, r2, r3);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int16(cv, nsg,            FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, (int16_t) ne12, FC_MUL_MV + 2);
+        ggml_metal_cv_set_int16(cv, r2,             FC_MUL_MV + 3);
+        ggml_metal_cv_set_int16(cv, r3,             FC_MUL_MV + 4);
+        res = ggml_metal_library_compile_pipeline(lib, "kernel_mul_mv_q6_K_f32_n2", name, cv);
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nr0 = N_R0_Q6_K;
+    res.nr1 = 2;
+    res.nsg = nsg;
+    res.smem = 0;
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
     char base[256];
     char name[256];

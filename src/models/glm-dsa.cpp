@@ -234,8 +234,14 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
     auto is_full_indexer_layer = [&](int il) {
         return glm_dsa_full_indexer_layers.count(il) > 0;
     };
-    // Carried across loop iterations: the most recent full layer's top_k.
+    // Carried across loop iterations: the most recent full layer's top_k and
+    // its materialized dense fallback mask.
     ggml_tensor * prev_full_topk = nullptr;
+    ggml_tensor * prev_full_dsa_mask = nullptr;
+    static const bool shared_mask_reuse = [] {
+        const char * value = std::getenv("LLAMA_DSA_SHARED_MASK_REUSE");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
     // ── AC3: end F/S bookkeeping setup ──────────────────────────────────────
 
     for (int il = 0; il < n_layer; ++il) {
@@ -269,6 +275,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
             // AC3: lightning indexer runs ONLY on "full" indexer layers.
             // "shared" layers skip this block and reuse prev_full_topk.
             if (is_full_indexer_layer(il)) {
+                prev_full_dsa_mask = nullptr;
                 ggml_tensor * indexer_q = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_q_b, qr);
                 cb(indexer_q, "indexer_q", il);
 
@@ -534,7 +541,8 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
                 // note: MLA with the absorption optimization converts into MQA (ie: GQA with 1 group)
                 cur = build_attn(inp_attn_dsa,
                         model.layers[il].wo, NULL, model.layers[il].wo_s,
-                        Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, top_k, kq_scale, il);
+                        Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, top_k,
+                        shared_mask_reuse ? &prev_full_dsa_mask : nullptr, kq_scale, il);
             }
         }
         if (il == n_layer - 1 && inp_out_ids && !cparams.embeddings_nextn) {
@@ -882,7 +890,7 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llama_model & model, const llm_g
 
         cur = build_attn(inp_attn_dsa,
                 layer.wo, NULL, layer.wo_s,
-                Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, top_k, kq_scale, il);
+                Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, top_k, nullptr, kq_scale, il);
         cb(cur, "mtp_attn_out", il);
     }
 

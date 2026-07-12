@@ -35,6 +35,11 @@ struct ggml_metal_op {
         bool use_fusion,
         bool use_concurrency,
         bool use_capture,
+        bool use_profile,
+        const char * profile_path,
+        uintptr_t profile_context_id,
+        int profile_compute_sequence,
+        int profile_command_buffer,
         int  debug_graph,
         int  debug_fusion) {
         this->dev             = dev;
@@ -46,6 +51,7 @@ struct ggml_metal_op {
         this->use_fusion      = use_fusion;
         this->use_concurrency = use_concurrency;
         this->use_capture     = use_capture;
+        this->profile_enabled = false;
         this->debug_graph     = debug_graph;
         this->debug_fusion    = debug_fusion;
         this->gf              = gf;
@@ -59,6 +65,20 @@ struct ggml_metal_op {
             if (!ggml_op_is_empty(gf->nodes[i]->op) && !ggml_is_empty(gf->nodes[i])) {
                 idxs.push_back(i);
             }
+        }
+
+        if (use_profile) {
+            GGML_LOG_DEBUG("%s: compute=%d command_buffer=%d graph=[%d,%d) profile_nodes=%zu\n", __func__,
+                    profile_compute_sequence, profile_command_buffer, idx_start, idx_end, idxs.size());
+            this->profile_enabled = ggml_metal_encoder_profile_init(
+                this->enc,
+                profile_path,
+                profile_context_id,
+                profile_compute_sequence,
+                profile_command_buffer,
+                idx_start,
+                idx_end,
+                idxs.size() * 2);
         }
     }
 
@@ -75,6 +95,11 @@ struct ggml_metal_op {
     ggml_tensor * node(int i) const {
         assert(i >= 0 && i < (int) idxs.size());
         return ggml_graph_node(gf, idxs[i]);
+    }
+
+    int graph_index(int i) const {
+        assert(i >= 0 && i < (int) idxs.size());
+        return idxs[i];
     }
 
     bool can_fuse(int i0, const ggml_op * ops, int n_ops) const {
@@ -96,6 +121,7 @@ struct ggml_metal_op {
     bool use_fusion;
     bool use_concurrency;
     bool use_capture;
+    bool profile_enabled;
 
     int debug_graph;
     int debug_fusion;
@@ -119,6 +145,11 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_fusion,
         bool use_concurrency,
         bool use_capture,
+        bool use_profile,
+        const char * profile_path,
+        uintptr_t profile_context_id,
+        int profile_compute_sequence,
+        int profile_command_buffer,
         int debug_graph,
         int debug_fusion) {
     ggml_metal_op_t res = new ggml_metal_op(
@@ -130,6 +161,11 @@ ggml_metal_op_t ggml_metal_op_init(
         use_fusion,
         use_concurrency,
         use_capture,
+        use_profile,
+        profile_path,
+        profile_context_id,
+        profile_compute_sequence,
+        profile_command_buffer,
         debug_graph,
         debug_fusion);
 
@@ -497,6 +533,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+    if (ctx->profile_enabled) {
+        ggml_metal_encoder_profile_begin(ctx->enc);
+    }
+
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
@@ -509,6 +549,17 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
 
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_pop(ctx->enc);
+    }
+
+    if (ctx->profile_enabled) {
+        const ggml_tensor * node = ctx->node(idx);
+        ggml_metal_encoder_profile_sample(
+            ctx->enc,
+            ctx->graph_index(idx),
+            ggml_op_name(node->op),
+            node->name,
+            res,
+            node->ne);
     }
 
     return res;
@@ -2059,6 +2110,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // to the matrix-vector kernel
     const int ne11_mm_min = 8;
 
+    static const bool q6_k_n2_pair = [] {
+        const char * value = getenv("GGML_METAL_Q6_K_N2_PAIR");
+        return value == nullptr || atoi(value) != 0;
+    }();
+
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
@@ -2212,7 +2268,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
     } else {
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
+        const bool use_q6_k_n2_pair = q6_k_n2_pair && op->src[0]->type == GGML_TYPE_Q6_K && ne11 == 2;
+        auto pipeline = use_q6_k_n2_pair
+            ? ggml_metal_library_get_pipeline_mul_mv_q6_k_n2(lib, op)
+            : ggml_metal_library_get_pipeline_mul_mv(lib, op);
 
         const int nr0 = pipeline.nr0;
         const int nr1 = pipeline.nr1;
@@ -3147,8 +3206,9 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
-    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->src[0]->type == op->src[1]->type);
+    GGML_ASSERT(op->src[0]->type == op->type);
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
 
     GGML_ASSERT(ggml_is_contiguous_rows(op->src[0]));
     GGML_ASSERT(ggml_is_contiguous_rows(op->src[1]));

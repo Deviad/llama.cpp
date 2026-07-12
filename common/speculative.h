@@ -62,6 +62,12 @@ bool common_speculative_need_embd(common_speculative * spec);
 // true if any implementation requires target nextn embeddings to be extracted
 bool common_speculative_need_embd_nextn(common_speculative * spec);
 
+// whether the implementation that generated this sequence's draft can retain its evaluated prefix
+bool common_speculative_can_reuse_draft_prefix(common_speculative * spec, llama_seq_id seq_id);
+
+// tell the generating implementation whether the server retained that prefix
+void common_speculative_set_draft_prefix_retained(common_speculative * spec, llama_seq_id seq_id, bool retained);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
