@@ -50,6 +50,15 @@ struct common_speculative_draft_params {
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
+// type of the implementation that generated the most recent draft for this sequence
+common_speculative_type common_speculative_get_last_type(common_speculative * spec, llama_seq_id seq_id);
+
+// retrieve the teacher-forced anchor for an external replay prefix, if present
+bool common_speculative_get_external_anchor(
+        common_speculative * spec,
+        const llama_tokens & prompt,
+        llama_token & anchor);
+
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 

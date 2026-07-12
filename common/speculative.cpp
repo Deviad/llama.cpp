@@ -9,24 +9,33 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include <nlohmann/json.hpp>
+
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <cinttypes>
+#include <stdexcept>
+#include <unordered_set>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+using json = nlohmann::ordered_json;
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
-    {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
-    {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
+    {"draft-mtp",      COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"draft-external", COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL},
+    {"ngram-simple",   COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
@@ -173,6 +182,202 @@ struct common_speculative_impl {
 
     virtual bool can_reuse_draft_prefix(llama_seq_id /*seq_id*/) const { return false; }
     virtual void set_draft_prefix_retained(llama_seq_id /*seq_id*/, bool /*retained*/) {}
+    virtual bool get_external_anchor(const llama_tokens & /*prompt*/, llama_token & /*anchor*/) const { return false; }
+};
+
+struct common_speculative_impl_draft_external : public common_speculative_impl {
+    struct replay_case {
+        std::string id;
+        llama_tokens prefix_tokens;
+        llama_token anchor_token;
+        llama_tokens draft_tokens;
+    };
+
+    common_params_speculative_draft params;
+    std::vector<replay_case> cases;
+
+    common_speculative_impl_draft_external(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL, n_seq)
+        , params(params.draft) {
+        const std::string & path = params.external.trace_path;
+        if (path.empty()) {
+            throw std::runtime_error("draft-external requires --spec-external-trace FNAME");
+        }
+
+        std::ifstream input(path);
+        if (!input) {
+            throw std::runtime_error("failed to open external speculative trace '" + path + "'");
+        }
+
+        try {
+            json document;
+            input >> document;
+            if (!document.is_object()) {
+                throw std::invalid_argument("root must be an object");
+            }
+            const std::unordered_set<std::string> root_fields = {
+                "schema", "provenance", "case_count", "max_draft_tokens", "cases",
+            };
+            for (const auto & field : document.items()) {
+                if (root_fields.count(field.key()) == 0) {
+                    throw std::invalid_argument("unknown root field '" + field.key() + "'");
+                }
+            }
+            if (document.size() != root_fields.size()) {
+                throw std::invalid_argument("root must contain schema, provenance, case_count, max_draft_tokens, and cases");
+            }
+            if (!document["schema"].is_string() ||
+                    document["schema"].get<std::string>() != "glm52_external_draft_replay.v1") {
+                throw std::invalid_argument("schema must be 'glm52_external_draft_replay.v1'");
+            }
+            if (!document["provenance"].is_object()) {
+                throw std::invalid_argument("provenance must be an object");
+            }
+            if (!document["cases"].is_array() || document["cases"].empty()) {
+                throw std::invalid_argument("cases must be a non-empty array");
+            }
+
+            auto parse_token = [](const json & value, const std::string & field) {
+                if ((!value.is_number_integer() && !value.is_number_unsigned())) {
+                    throw std::invalid_argument(field + " must contain integer token IDs");
+                }
+                const int64_t token = value.get<int64_t>();
+                if (token < 0 || token > std::numeric_limits<llama_token>::max()) {
+                    throw std::invalid_argument(field + " contains an out-of-range token ID");
+                }
+                return (llama_token) token;
+            };
+
+            std::unordered_set<std::string> case_ids;
+            size_t max_draft_tokens = 0;
+            for (size_t i = 0; i < document["cases"].size(); ++i) {
+                const auto & item = document["cases"][i];
+                const std::string label = "cases[" + std::to_string(i) + "]";
+                if (!item.is_object()) {
+                    throw std::invalid_argument(label + " must be an object");
+                }
+                const std::unordered_set<std::string> case_fields = {
+                    "id", "capture", "capture_sha256", "prefix_tokens", "prefix_tokens_sha256",
+                    "anchor_position", "anchor_token", "draft_tokens", "draft_tokens_sha256",
+                    "target_greedy_tokens", "target_greedy_tokens_sha256", "accepted_prefix",
+                };
+                for (const auto & field : item.items()) {
+                    if (case_fields.count(field.key()) == 0) {
+                        throw std::invalid_argument(label + " contains unknown field '" + field.key() + "'");
+                    }
+                }
+                if (!item.contains("id") || !item["id"].is_string() || item["id"].get<std::string>().empty()) {
+                    throw std::invalid_argument(label + ".id must be a non-empty string");
+                }
+
+                replay_case current;
+                current.id = item["id"].get<std::string>();
+                if (!case_ids.insert(current.id).second) {
+                    throw std::invalid_argument("duplicate case id '" + current.id + "'");
+                }
+
+                if (!item.contains("prefix_tokens") || !item["prefix_tokens"].is_array() || item["prefix_tokens"].empty()) {
+                    throw std::invalid_argument(label + ".prefix_tokens must be a non-empty array");
+                }
+                current.prefix_tokens.reserve(item["prefix_tokens"].size());
+                for (const auto & value : item["prefix_tokens"]) {
+                    current.prefix_tokens.push_back(parse_token(value, label + ".prefix_tokens"));
+                }
+
+                if (!item.contains("anchor_token")) {
+                    throw std::invalid_argument(label + ".anchor_token is required");
+                }
+                current.anchor_token = parse_token(item["anchor_token"], label + ".anchor_token");
+
+                if (!item.contains("draft_tokens") || !item["draft_tokens"].is_array() || item["draft_tokens"].empty()) {
+                    throw std::invalid_argument(label + ".draft_tokens must be a non-empty array");
+                }
+                current.draft_tokens.reserve(item["draft_tokens"].size());
+                for (const auto & value : item["draft_tokens"]) {
+                    current.draft_tokens.push_back(parse_token(value, label + ".draft_tokens"));
+                }
+                max_draft_tokens = std::max(max_draft_tokens, current.draft_tokens.size());
+                cases.push_back(std::move(current));
+            }
+
+            for (size_t i = 0; i < cases.size(); ++i) {
+                for (size_t j = i + 1; j < cases.size(); ++j) {
+                    if (cases[i].prefix_tokens == cases[j].prefix_tokens) {
+                        throw std::invalid_argument("ambiguous duplicate prefix for cases '" +
+                                cases[i].id + "' and '" + cases[j].id + "'");
+                    }
+                }
+            }
+
+            if ((!document["case_count"].is_number_integer() && !document["case_count"].is_number_unsigned()) ||
+                    document["case_count"].get<int64_t>() != (int64_t) cases.size()) {
+                throw std::invalid_argument("case_count does not match cases");
+            }
+            if ((!document["max_draft_tokens"].is_number_integer() && !document["max_draft_tokens"].is_number_unsigned()) ||
+                    document["max_draft_tokens"].get<int64_t>() != (int64_t) max_draft_tokens) {
+                throw std::invalid_argument("max_draft_tokens does not match cases");
+            }
+        } catch (const std::exception & e) {
+            throw std::runtime_error("invalid external speculative trace '" + path + "': " + e.what());
+        }
+
+        LOG_INF("%s: adding speculative implementation 'draft-external' from '%s' with %zu cases\n",
+                __func__, path.c_str(), cases.size());
+    }
+
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {}
+
+    bool process(const llama_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (auto & dp : dparams) {
+            if (!dp.drafting || dp.prompt == nullptr || dp.result == nullptr) {
+                continue;
+            }
+
+            const replay_case * matched = nullptr;
+            for (const auto & item : cases) {
+                if (item.anchor_token != dp.id_last || item.prefix_tokens != *dp.prompt) {
+                    continue;
+                }
+                if (matched != nullptr) {
+                    throw std::runtime_error("ambiguous external speculative trace match between cases '" +
+                            matched->id + "' and '" + item.id + "'");
+                }
+                matched = &item;
+            }
+
+            if (matched == nullptr) {
+                continue;
+            }
+
+            size_t n_emit = std::min(matched->draft_tokens.size(), (size_t) std::max(0, params.n_max));
+            if (dp.n_max >= 0) {
+                n_emit = std::min(n_emit, (size_t) dp.n_max);
+            }
+            dp.result->assign(matched->draft_tokens.begin(), matched->draft_tokens.begin() + n_emit);
+            LOG_DBG("%s: matched external draft case '%s', emitted %zu tokens\n",
+                    __func__, matched->id.c_str(), n_emit);
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {}
+
+    bool get_external_anchor(const llama_tokens & prompt, llama_token & anchor) const override {
+        for (const auto & item : cases) {
+            if (item.prefix_tokens == prompt) {
+                anchor = item.anchor_token;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool need_embd() const override {
+        return false;
+    }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1882,16 +2087,17 @@ const char * common_speculative_all_types_str() {
 
 std::string common_speculative_type_to_str(common_speculative_type type) {
     switch (type) {
-        case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
-        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
-        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
-        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
-        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
-        default:                                    return "unknown";
+        case COMMON_SPECULATIVE_TYPE_NONE:           return "none";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:   return "draft-simple";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:   return "draft-eagle3";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:      return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL: return "draft-external";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:   return "ngram-simple";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:    return "ngram-map-k";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:  return "ngram-map-k4v";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:      return "ngram-mod";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:    return "ngram-cache";
+        default:                                     return "unknown";
     }
 }
 
@@ -1938,6 +2144,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
@@ -1972,11 +2179,18 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     {
         uint32_t enabled_configs = common_get_enabled_speculative_configs(params.types);
 
-        bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
-        bool has_draft_eagle3 = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3)) && params.draft.ctx_dft != nullptr;
-        bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
-
-
+        bool has_draft_simple   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
+        bool has_draft_eagle3   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3)) && params.draft.ctx_dft != nullptr;
+        bool has_mtp            = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
+        bool has_draft_external = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL));
+        const size_t n_enabled_types = std::count_if(params.types.begin(), params.types.end(),
+                [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; });
+        if (has_draft_external &&
+                (n_enabled_types != 1 ||
+                 params.draft.ctx_dft != nullptr ||
+                 params.has_dft())) {
+            throw std::invalid_argument("draft-external must be the only speculative type and cannot use a draft/MTP context");
+        }
 
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
@@ -1985,7 +2199,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 9);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2005,6 +2219,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
+        }
+        if (has_draft_external) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL, params));
         }
         if (has_draft_simple) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, params));
@@ -2033,6 +2250,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_external>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
@@ -2112,6 +2333,31 @@ common_speculative_draft_params & common_speculative_get_draft_params(
     GGML_ASSERT(seq_id < (llama_seq_id) spec->dparams.size());
 
     return spec->dparams[seq_id];
+}
+
+common_speculative_type common_speculative_get_last_type(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_last.size()) {
+        return COMMON_SPECULATIVE_TYPE_COUNT;
+    }
+
+    const common_speculative_impl * impl = spec->impl_last[seq_id];
+    return impl == nullptr ? COMMON_SPECULATIVE_TYPE_COUNT : impl->type;
+}
+
+bool common_speculative_get_external_anchor(
+        common_speculative * spec,
+        const llama_tokens & prompt,
+        llama_token & anchor) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (impl->get_external_anchor(prompt, anchor)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt) {

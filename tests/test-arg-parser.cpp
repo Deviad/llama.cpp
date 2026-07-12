@@ -1,7 +1,11 @@
 #include "arg.h"
 #include "common.h"
 #include "download.h"
+#include "speculative.h"
 
+#include <cstdio>
+#include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -131,6 +135,119 @@ int main(void) {
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
+
+    common_params external_params;
+    argv = {"binary_name", "--spec-type", "draft-external", "--spec-external-trace", "trace.json", "--spec-draft-n-max", "7"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), external_params, LLAMA_EXAMPLE_SERVER));
+    assert(common_speculative_type_from_name("draft-external") == COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL);
+    assert(common_speculative_type_to_str(COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL) == "draft-external");
+    assert(external_params.speculative.external.trace_path == "trace.json");
+    assert(common_speculative_n_max(&external_params.speculative) == 7);
+    assert(external_params.speculative.need_n_rs_seq() == 7);
+
+    {
+        common_params_speculative replay_params;
+        replay_params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL };
+        replay_params.draft.n_max = 2;
+
+        replay_params.external.trace_path = "test-arg-parser-missing-external-trace.json";
+        std::remove(replay_params.external.trace_path.c_str());
+        try {
+            common_speculative_free(common_speculative_init(replay_params, 1));
+            assert(false && "missing external trace must fail");
+        } catch (const std::runtime_error &) {
+        }
+
+        const char * trace_path = "test-arg-parser-external-trace.json";
+        {
+            std::ofstream output(trace_path);
+            output << "{}";
+        }
+        replay_params.external.trace_path = trace_path;
+        try {
+            common_speculative_free(common_speculative_init(replay_params, 1));
+            assert(false && "malformed external trace must fail");
+        } catch (const std::runtime_error &) {
+        }
+
+        const std::vector<std::string> invalid_traces = {
+            R"({"schema":"glm52_external_draft_replay.v1","provenance":{},"max_draft_tokens":1,"cases":[{"id":"a","prefix_tokens":[1],"anchor_token":2,"draft_tokens":[3]}]})",
+            R"({"schema":"glm52_external_draft_replay.v1","provenance":{},"case_count":1,"max_draft_tokens":1,"unknown":0,"cases":[{"id":"a","prefix_tokens":[1],"anchor_token":2,"draft_tokens":[3]}]})",
+            R"({"schema":"glm52_external_draft_replay.v1","provenance":{},"case_count":2,"max_draft_tokens":1,"cases":[{"id":"a","prefix_tokens":[1],"anchor_token":2,"draft_tokens":[3]},{"id":"a","prefix_tokens":[2],"anchor_token":3,"draft_tokens":[4]}]})",
+            R"({"schema":"glm52_external_draft_replay.v1","provenance":{},"case_count":2,"max_draft_tokens":1,"cases":[{"id":"a","prefix_tokens":[1],"anchor_token":2,"draft_tokens":[3]},{"id":"b","prefix_tokens":[1],"anchor_token":4,"draft_tokens":[5]}]})",
+            R"({"schema":"glm52_external_draft_replay.v1","provenance":{},"case_count":2,"max_draft_tokens":1,"cases":[{"id":"a","prefix_tokens":[1],"anchor_token":2,"draft_tokens":[3]}]})",
+            R"({"schema":"glm52_external_draft_replay.v1","provenance":{},"case_count":1,"max_draft_tokens":2,"cases":[{"id":"a","prefix_tokens":[1],"anchor_token":2,"draft_tokens":[3]}]})",
+            R"({"schema":"glm52_external_draft_replay.v1","provenance":{},"case_count":1,"max_draft_tokens":1,"cases":[{"id":"a","prefix_tokens":[2147483648],"anchor_token":2,"draft_tokens":[3]}]})",
+            R"({"schema":"glm52_external_draft_replay.v1","provenance":{},"case_count":1,"max_draft_tokens":1,"cases":[{"id":"a","prefix_tokens":[1],"anchor_token":2,"draft_tokens":[3],"unknown":0}]})",
+        };
+        for (const auto & contents : invalid_traces) {
+            {
+                std::ofstream output(trace_path);
+                output << contents;
+            }
+            try {
+                common_speculative_free(common_speculative_init(replay_params, 1));
+                assert(false && "invalid external trace must fail");
+            } catch (const std::runtime_error &) {
+            }
+        }
+
+        {
+            std::ofstream output(trace_path);
+            output << R"({"schema":"glm52_external_draft_replay.v1","provenance":{},"case_count":1,"max_draft_tokens":3,"cases":[{"id":"case-a","prefix_tokens":[1,2],"anchor_token":3,"draft_tokens":[4,5,6]}]})";
+        }
+        common_speculative * replay = common_speculative_init(replay_params, 1);
+        llama_tokens prompt = { 1, 2 };
+        llama_token forced_anchor = LLAMA_TOKEN_NULL;
+        assert(common_speculative_get_external_anchor(replay, prompt, forced_anchor));
+        assert(forced_anchor == 3);
+        assert(!common_speculative_get_external_anchor(replay, llama_tokens({ 1 }), forced_anchor));
+        llama_tokens result;
+        common_speculative_get_draft_params(replay, 0) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ 1,
+            /* .n_past   = */ 2,
+            /* .id_last  = */ 3,
+            /* .prompt   = */ &prompt,
+            /* .result   = */ &result,
+        };
+        common_speculative_draft(replay);
+        assert(result == llama_tokens({ 4 }));
+
+        result.clear();
+        auto & draft_params = common_speculative_get_draft_params(replay, 0);
+        draft_params.drafting = true;
+        draft_params.n_max = 3;
+        common_speculative_draft(replay);
+        assert(result == llama_tokens({ 4, 5 }));
+
+        result.clear();
+        draft_params.drafting = true;
+        draft_params.id_last = 99;
+        common_speculative_draft(replay);
+        assert(result.empty());
+
+        auto incompatible = replay_params;
+        incompatible.types = {
+            COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL,
+            COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
+        };
+        try {
+            common_speculative_free(common_speculative_init(incompatible, 1));
+            assert(false && "combined external speculative types must fail");
+        } catch (const std::invalid_argument &) {
+        }
+        incompatible = replay_params;
+        incompatible.draft.mparams.path = "draft.gguf";
+        try {
+            common_speculative_free(common_speculative_init(incompatible, 1));
+            assert(false && "external replay with draft model must fail");
+        } catch (const std::invalid_argument &) {
+        }
+
+        common_speculative_free(replay);
+        std::remove(trace_path);
+    }
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};

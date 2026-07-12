@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -80,6 +82,11 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+
+    bool    spec_target_profile_active    = false;
+    bool    spec_external_anchor_forced   = false;
+    int64_t spec_target_profile_start_us  = 0;
+    double  spec_target_profile_decode_ms = 0.0;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -228,6 +235,11 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+
+        spec_target_profile_active    = false;
+        spec_external_anchor_forced   = false;
+        spec_target_profile_start_us  = 0;
+        spec_target_profile_decode_ms = 0.0;
 
         task_prev = std::move(task);
         task.reset();
@@ -803,6 +815,8 @@ private:
 
     common_speculative_ptr spec;
 
+    bool spec_target_profile_enabled = false;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -832,6 +846,50 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
+
+    void emit_spec_target_profile(
+            server_slot & slot,
+            size_t n_draft,
+            size_t n_accepted,
+            uint32_t n_rollback,
+            double sample_accept_ms,
+            int64_t rollback_start_us,
+            bool use_checkpoint) {
+        if (!slot.spec_target_profile_active) {
+            return;
+        }
+
+        const int64_t now = ggml_time_us();
+        const char * seq_rm_mode = "none";
+        switch (ctx_tgt_seq_rm_type) {
+            case COMMON_CONTEXT_SEQ_RM_TYPE_PART: seq_rm_mode = "partial"; break;
+            case COMMON_CONTEXT_SEQ_RM_TYPE_FULL: seq_rm_mode = "full";    break;
+            case COMMON_CONTEXT_SEQ_RM_TYPE_RS:   seq_rm_mode = "bounded"; break;
+            case COMMON_CONTEXT_SEQ_RM_TYPE_NO:   break;
+        }
+
+        const char * rollback_mode = use_checkpoint ? "checkpoint_restore" :
+                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ? "bounded_seq_rm" : "seq_rm");
+        json profile = {
+            {"slot", slot.id},
+            {"n_draft", n_draft},
+            {"verifier_decode_ms", slot.spec_target_profile_decode_ms},
+            {"sample_accept_ms", sample_accept_ms},
+            {"rollback_ms", (now - rollback_start_us) / 1000.0},
+            {"target_cycle_ms", (now - slot.spec_target_profile_start_us) / 1000.0},
+            {"n_accepted", n_accepted},
+            {"n_rollback", n_rollback},
+            {"rollback_mode", rollback_mode},
+            {"seq_rm_mode", seq_rm_mode},
+            {"catchup_fused_into_next_verify", true},
+            {"draft_context_catchup_executed", false},
+            {"external_anchor_forced", slot.spec_external_anchor_forced},
+        };
+        std::fprintf(stderr, "SPEC_TARGET_PROFILE %s\n", profile.dump().c_str());
+        std::fflush(stderr);
+
+        slot.spec_target_profile_active = false;
+    }
 
     void destroy() {
         spec.reset();
@@ -872,6 +930,25 @@ private:
 
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        const bool has_external_draft = std::find(params_base.speculative.types.begin(),
+                params_base.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL) != params_base.speculative.types.end();
+        const size_t n_enabled_spec_types = std::count_if(
+                params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; });
+        if (has_external_draft &&
+                (n_enabled_spec_types != 1 || params_base.speculative.has_dft())) {
+            SRV_ERR("draft-external must be the only speculative type and cannot use a draft/MTP model "
+                    "(enabled_types=%zu, has_dft=%d)\n",
+                    n_enabled_spec_types, params_base.speculative.has_dft());
+            return false;
+        }
+        const char * profile_env = std::getenv("LLAMA_SPEC_TARGET_PROFILE");
+        spec_target_profile_enabled = has_external_draft && profile_env != nullptr && std::string(profile_env) == "1";
+        if (spec_target_profile_enabled && params_base.n_parallel != 1) {
+            SRV_WRN("%s", "LLAMA_SPEC_TARGET_PROFILE requires --parallel 1; profiling disabled\n");
+            spec_target_profile_enabled = false;
+        }
 
         std::string & mmproj_path = params_base.mmproj.path;
         bool has_mmproj = !mmproj_path.empty();
@@ -1158,7 +1235,15 @@ private:
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+                if (has_external_draft) {
+                    return false;
+                }
             }
+        }
+
+        if (has_external_draft && !spec) {
+            SRV_ERR("%s", "failed to initialize external speculative replay\n");
+            return false;
         }
 
         if (ctx_dft) {
@@ -2667,6 +2752,17 @@ private:
             common_speculative_draft(spec.get());
         }
 
+        if (spec_target_profile_enabled) {
+            for (auto * slot : drafting) {
+                if (!slot->spec_draft.empty() &&
+                        common_speculative_get_last_type(spec.get(), slot->id) == COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL) {
+                    slot->spec_target_profile_active    = true;
+                    slot->spec_target_profile_start_us  = ggml_time_us();
+                    slot->spec_target_profile_decode_ms = 0.0;
+                }
+            }
+        }
+
         // make checkpoints if needed
         for (auto * slot_ptr : drafting) {
             auto & slot = *slot_ptr;
@@ -3320,7 +3416,28 @@ private:
                 batch.logits   + i,
             };
 
+            server_slot * profile_decode_slot = nullptr;
+            if (spec_target_profile_enabled) {
+                for (auto & slot : slots) {
+                    if (!slot.spec_target_profile_active) {
+                        continue;
+                    }
+                    const bool in_view = std::any_of(slot.spec_i_batch.begin(), slot.spec_i_batch.end(),
+                            [&](int32_t index) { return index >= i && index < i + n_tokens; });
+                    if (in_view) {
+                        profile_decode_slot = &slot;
+                        break;
+                    }
+                }
+            }
+
+            const int64_t profile_decode_start = profile_decode_slot ? ggml_time_us() : 0;
             const int ret = llama_decode(ctx_tgt, batch_view);
+            if (profile_decode_slot) {
+                llama_synchronize(ctx_tgt);
+                profile_decode_slot->spec_target_profile_decode_ms +=
+                        (ggml_time_us() - profile_decode_start) / 1000.0;
+            }
 
             metrics.on_decoded(slots);
 
@@ -3458,7 +3575,16 @@ private:
 
                 const int tok_idx = slot.i_batch - i;
 
-                llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                llama_token id = LLAMA_TOKEN_NULL;
+                const bool force_external_anchor = slot.n_decoded == 0 &&
+                        common_speculative_get_external_anchor(
+                            spec.get(), slot.prompt.tokens.get_text_tokens(), id);
+                if (force_external_anchor) {
+                    llama_synchronize(slot.ctx_tgt);
+                    slot.spec_external_anchor_forced = true;
+                } else {
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                }
 
                 slot.i_batch = -1;
 
@@ -3512,18 +3638,31 @@ private:
 
                 GGML_ASSERT(n_draft > 0);
 
+                double profile_sample_accept_ms = 0.0;
+                int64_t profile_rollback_start_us = 0;
+                uint32_t profile_n_rollback = 0;
+                size_t profile_n_accepted = 0;
+
                 // verify and try to accept the draft
                 {
+                    const int64_t profile_sample_start_us = slot.spec_target_profile_active ? ggml_time_us() : 0;
+
                     // save the sampler sampler state in case we need to restore it
                     common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                     auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    if (slot.spec_target_profile_active) {
+                        profile_rollback_start_us = ggml_time_us();
+                        profile_sample_accept_ms = (profile_rollback_start_us - profile_sample_start_us) / 1000.0;
+                    }
                     slot.spec_i_batch.clear();
 
                     GGML_ASSERT(accepted.size() >= 1);
 
                     const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+                    profile_n_rollback = n_rollback;
+                    profile_n_accepted = accepted.size() - 1;
 
                     const bool use_ckpt_tgt =
                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
@@ -3558,6 +3697,8 @@ private:
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);
                             slot.smpl = std::move(smpl_save);
 
+                            emit_spec_target_profile(slot, n_draft, profile_n_accepted, profile_n_rollback,
+                                    profile_sample_accept_ms, profile_rollback_start_us, true);
                             continue;
                         }
                     }
@@ -3599,6 +3740,9 @@ private:
                 if (slot.ctx_dft) {
                     common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
                 }
+
+                emit_spec_target_profile(slot, n_draft, profile_n_accepted, profile_n_rollback,
+                        profile_sample_accept_ms, profile_rollback_start_us, false);
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;

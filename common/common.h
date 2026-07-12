@@ -160,7 +160,8 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,      // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL, // precomputed external draft replay
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -335,6 +336,10 @@ struct common_params_speculative_draft {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 };
 
+struct common_params_speculative_external {
+    std::string trace_path;
+};
+
 struct common_params_speculative_ngram_mod {
     int32_t n_match = 24;
 
@@ -358,6 +363,7 @@ struct common_params_speculative {
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
+    common_params_speculative_external external;
 
     common_params_speculative_ngram_mod ngram_mod;
     common_params_speculative_ngram_map ngram_simple;
@@ -372,10 +378,12 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EXTERNAL;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        return needs_rs_seq ? std::max(0, draft.n_max) : 0u;
     }
 };
 
